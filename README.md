@@ -233,6 +233,10 @@ RESEARCH.md           the full research story. Start here.
 DESIGN.md             the dashboard's design law
 ```
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Disclaimer
 
 This is not financial advice and this software does not produce reliable income. The

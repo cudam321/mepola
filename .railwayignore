@@ -1,0 +1,39 @@
+# ============================================================================
+# SECRETS FIRST — .env holds the Telegram session string (full account access)
+# and API keys. It must NEVER enter the build context or the image. Secrets go
+# into Railway environment variables only.
+# ============================================================================
+.env
+.env.*
+*.session
+*.session-journal
+
+# huge / local-only trees
+data_cache
+.venv
+vendor
+dashboard/frontend/node_modules
+dashboard/frontend/dist
+**/__pycache__
+.pytest_cache
+.git
+.gitignore
+.DS_Store
+
+# research / dev-only (not needed at runtime)
+tasks
+scripts
+tests
+docs
+reports
+
+# deploy: keep only deploy/railway/ (systemd units + VPS scripts stay out)
+deploy/*
+!deploy/railway
+
+# runs: exclude everything EXCEPT the seed DB.
+# Ordering matters: the broad pattern comes first, the ! negation re-includes.
+# `runs/*` (not `runs`) is used so the directory itself isn't pruned before the
+# negation can match — this works under both dockerignore and gitignore rules.
+runs/*
+!runs/live_state.db

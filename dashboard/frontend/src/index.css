@@ -1,0 +1,223 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   MEPOLA — VINTAGE OS / PHOSPHOR CRT (lime)
+   Native port of the approved skin (design_handoff_mepola_phosphor_crt).
+   Tokens live in tailwind.config.js; this file owns fonts, texture,
+   frames, brackets, ignition, and the CRT overlay.
+   ============================================================ */
+
+/* Departure Mono — self-hosted (Helena Zhang, OFL). Chunky pixel monospace. */
+@font-face {
+  font-family: "DepartureMono";
+  src: url("/fonts/DepartureMono-Regular.woff2") format("woff2"),
+    url("/fonts/DepartureMono-Regular.woff") format("woff");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+html, body, #root { height: 100%; }
+
+/* ---- everything is the pixel font ---- */
+body, input, button, textarea, select, .num, pre, code {
+  font-family: "DepartureMono", "Pixelify Sans", ui-monospace, "Courier New", monospace;
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: none;
+  font-smooth: never;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(120% 90% at 50% -10%, rgba(147, 192, 31, 0.1), transparent 55%),
+    radial-gradient(140% 120% at 50% 120%, rgba(147, 192, 31, 0.05), transparent 60%),
+    #060a05;
+  color: #a6d63c;
+  font-size: 14px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  /* Departure Mono ships one weight — never smear the pixels with synthesized bold */
+  font-synthesis: none;
+  text-shadow: 0 0 1px rgba(147, 192, 31, 0.35);
+}
+
+/* Departure Mono is wider than Inter — tame the wide caps-tracking and the
+   tiniest labels so dense micro-grids don't collide */
+[class*="tracking-["] { letter-spacing: 0.02em !important; }
+.tile-label { letter-spacing: 0.03em !important; }
+[class*="text-[8"] { font-size: 8px !important; letter-spacing: 0 !important; }
+[class*="text-[9px]"] { letter-spacing: 0 !important; }
+
+/* ---- CRT overlay: scanlines + vignette + faint flicker (never blocks clicks) ---- */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.32) 0px, rgba(0, 0, 0, 0.32) 1px, transparent 1px, transparent 3px),
+    repeating-linear-gradient(90deg, rgba(147, 192, 31, 0.04) 0px, rgba(147, 192, 31, 0.04) 1px, transparent 1px, transparent 3px);
+  mix-blend-mode: multiply;
+  animation: mepola-flick 5.5s steps(60) infinite;
+}
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  background: radial-gradient(130% 130% at 50% 50%, transparent 58%, rgba(0, 0, 0, 0.55) 100%);
+  box-shadow: inset 0 0 140px rgba(0, 0, 0, 0.7);
+}
+@keyframes mepola-flick {
+  0%, 100% { opacity: 1; }
+  92% { opacity: 1; }
+  93% { opacity: 0.86; }
+  94% { opacity: 1; }
+  96% { opacity: 0.94; }
+  97% { opacity: 1; }
+}
+
+::selection { background: rgba(147, 192, 31, 0.35); color: #eaffc0; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #070c05; }
+::-webkit-scrollbar-thumb { background: rgba(147, 192, 31, 0.28); border: 2px solid #070c05; }
+::-webkit-scrollbar-thumb:hover { background: rgba(147, 192, 31, 0.45); }
+
+/* ---- panels become box-drawing frames: solid surface, NO blur ---- */
+.panel {
+  position: relative;
+  background: rgba(9, 15, 6, 0.82);
+  border: 1px solid rgba(147, 192, 31, 0.34);
+  border-radius: 2px;
+  box-shadow: inset 0 0 0 1px rgba(147, 192, 31, 0.05), 0 0 0 1px rgba(0, 0, 0, 0.5),
+    0 10px 30px rgba(0, 0, 0, 0.5);
+  transition: border-color 150ms ease;
+}
+.panel-hover:hover { border-color: rgba(147, 192, 31, 0.55); }
+/* two opposite corner glyphs read as a drawn frame ┌ ┘ */
+.panel::before,
+.panel::after {
+  position: absolute;
+  color: #93c01f;
+  font-size: 13px;
+  line-height: 1;
+  text-shadow: 0 0 5px rgba(147, 192, 31, 0.7);
+  pointer-events: none;
+  z-index: 2;
+}
+.panel::before { content: "\250C"; top: -1px; left: 1px; }
+.panel::after { content: "\2518"; bottom: -2px; right: 2px; }
+
+/* panel section titles → prompt-prefixed ▍ in the bright phosphor */
+.panel-title {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #cbf14e !important;
+  text-shadow: 0 0 6px rgba(147, 192, 31, 0.55);
+}
+.panel-title::before { content: "\258D "; color: #93c01f; opacity: 0.9; }
+
+/* every small uppercase label wears brackets */
+.tile-label {
+  font-size: 13px;
+  text-transform: uppercase;
+  color: #6f8e38;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.tile-label::before { content: "[ "; opacity: 0.75; }
+.tile-label::after { content: " ]"; opacity: 0.75; }
+
+/* pill badges → [BRACKET] chips */
+.mepola-badge {
+  border-radius: 2px;
+  background: rgba(147, 192, 31, 0.06);
+  border: 1px solid rgba(147, 192, 31, 0.3);
+  padding-top: 1px;
+  padding-bottom: 1px;
+  text-shadow: 0 0 5px rgba(147, 192, 31, 0.4);
+  white-space: nowrap;
+}
+.mepola-badge::before { content: "["; opacity: 0.85; margin-right: 1px; }
+.mepola-badge::after { content: "]"; opacity: 0.85; margin-left: 1px; }
+
+/* ---- reserved incandescent: >=10x winners ignite ---- */
+.ignite {
+  color: #f6ffe1 !important;
+  text-shadow: 0 0 4px #eeffb0, 0 0 12px #b6e22e, 0 0 26px rgba(147, 192, 31, 0.75) !important;
+  animation: mepola-ignite-pulse 2.6s ease-in-out infinite;
+  font-weight: 400 !important;
+}
+@keyframes mepola-ignite-pulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.28); }
+}
+
+/* ---- wordmark: block-ASCII banner + tracked subtitle ---- */
+.mepola-wm-wrap { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.mepola-wm-ascii {
+  margin: 0;
+  font-size: 7px;
+  line-height: 7px;
+  letter-spacing: 0;
+  color: #cbf14e;
+  text-shadow: 0 0 5px rgba(147, 192, 31, 0.7), 0 0 14px rgba(147, 192, 31, 0.35);
+  white-space: pre;
+  user-select: none;
+}
+.mepola-wm-sub {
+  font-size: 9px;
+  letter-spacing: 0.34em;
+  color: #6f8e38;
+  text-transform: uppercase;
+}
+
+/* ---- modal scrim: solid, no blur (no backdrop-filter anywhere) ---- */
+.modal-scrim { background: rgba(3, 6, 2, 0.9); }
+
+/* ---- inputs / buttons take the phosphor ---- */
+input, select, textarea {
+  background: rgba(147, 192, 31, 0.05);
+  border-color: rgba(147, 192, 31, 0.3);
+  color: #cbf14e;
+}
+button { text-shadow: 0 0 4px rgba(147, 192, 31, 0.3); }
+
+/* Numerics: always mono + tabular (sans == mono now, kept for API compat) */
+.num { font-variant-numeric: tabular-nums; }
+.font-mono, table, tbody { font-variant-numeric: tabular-nums; }
+
+/* ASCII spinner: | / - \ cycling via steps() */
+.ascii-spinner::before {
+  content: "|";
+  display: inline-block;
+  animation: asciispin 0.7s steps(4, end) infinite;
+}
+@keyframes asciispin {
+  0% { content: "|"; }
+  25% { content: "/"; }
+  50% { content: "-"; }
+  75% { content: "\\"; }
+}
+
+.pulse-dot { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* the ONE blinking block cursor (header status line) */
+.blink-cursor { animation: blink 1.1s steps(1, end) infinite; }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+button, tr, a {
+  transition: color 150ms ease, background-color 150ms ease, border-color 150ms ease,
+    opacity 150ms ease;
+}
+
+/* keep charts crisp under the overlay */
+canvas { image-rendering: auto; }

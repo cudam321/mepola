@@ -1,0 +1,19 @@
+# secrets — NEVER commit
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+
+# heavy / generated / local state
+data_cache/
+runs/
+.venv/
+node_modules/
+dashboard/frontend/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+vendor/
+nohup.out
+.DS_Store

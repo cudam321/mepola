@@ -1,0 +1,22 @@
+[Unit]
+Description=memebot 24/7 paper-trading engine (tail-rider #1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# NOTE: a dedicated non-root user is a nice-to-have; root keeps v1 simple.
+User=root
+WorkingDirectory=/opt/memebot
+EnvironmentFile=/opt/memebot/.env
+Environment=PYTHONPATH=/opt/memebot/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/memebot/.venv/bin/python -m memebot.live.run
+# telethon disconnect => process exits => systemd restarts. This is the recovery model.
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=memebot dashboard (FastAPI, bound to 127.0.0.1 ONLY -- access via Tailscale or SSH tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# NOTE: a dedicated non-root user is a nice-to-have; root keeps v1 simple.
+User=root
+WorkingDirectory=/opt/memebot
+EnvironmentFile=/opt/memebot/.env
+Environment=PYTHONPATH=/opt/memebot/src:/opt/memebot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/memebot/.venv/bin/python -m uvicorn dashboard.server.app:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

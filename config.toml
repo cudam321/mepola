@@ -1,0 +1,84 @@
+# Default tunables for the measurement harness. Conservative-but-realistic defaults
+# drawn from the research; every number here is meant to be overridden once we have
+# MEASURED values (real latency from Phase 1, real fills from Phase 5 dust trades).
+
+[network]
+chain = "solana"
+gecko_network = "solana"   # GeckoTerminal network slug
+
+[backtest]
+# Exit horizons evaluated for every call. Phase 0.5 answers: at which (if any) does
+# this channel have a real, latency-survivable edge?
+horizons = ["30s", "5m", "15m", "1h", "4h", "1d"]
+# A call's token with no locatable pool / no liquidity is scored as a total loss
+# (you could not have profitably exited) — this keeps the dead-token denominator honest.
+unsellable_is_total_loss = true
+
+[cost_model]
+# NOTE (audit #22): this section is read ONLY by the research/backtest harness, NOT the live engine.
+# The LIVE executor's slippage is fixed in code (src/memebot/live/executor.py: entry 300 bps / exit
+# 800 bps — a real exit into a collapsing pool needs the wider room). Editing exit_slippage_bps here
+# does NOT change live behaviour.
+# End-to-end reaction+broadcast+land latency (seconds). PLACEHOLDER until Phase 1
+# measures it for real; the public-signal edge is gone if this is too large.
+latency_seconds = 3.0
+
+# Per-side slippage for microcaps (basis points). Memecoin launches are 5-10%+.
+entry_slippage_bps = 300
+exit_slippage_bps = 300
+
+# Venue fees (basis points). pump.fun bonding-curve fee is DYNAMIC by market cap
+# (~95bps under $300k MC down to ~5bps above $1M); PumpSwap AMM ~30bps.
+pumpfun_fee_bps = 95
+pumpswap_fee_bps = 30
+
+# Fixed per-transaction costs in SOL (priority fee + Jito tip). Charged on BOTH the
+# buy and the sell tx — deliberately heavy on small tickets, which is the point.
+priority_fee_sol = 0.001
+jito_tip_sol = 0.005
+
+# Sandwich/MEV drag per round trip (bps). ~70 with protection, ~300 without.
+mev_drag_bps = 70
+
+# Notional per simulated trade (SOL). Drives how badly fixed SOL costs bite.
+trade_size_sol = 0.1
+
+[risk_governor]
+# NOTE (audit #22): DEAD for the live engine — it reads live caps from [strategy.tailrider] below
+# (max_concurrent / total_deployed_cap_usd / daily_loss_cap_usd) plus dashboard ctl_* overrides.
+# Editing the keys in THIS section has NO effect on the running bot. Kept only as historical
+# research-phase defaults.
+speculative_sleeve_usd = 300        # the most you'd accept TOTALLY losing
+per_trade_fraction = 0.01           # flat tiny fraction of the sleeve, survival-first
+max_concurrent_positions = 6
+daily_loss_limit_fraction = 0.05
+soft_limit_fraction = 0.65          # personal stop at 65% of the hard daily limit
+recover_principal_at_multiple = 2.0 # sell to recover stake by 2x ("house money")
+moonbag_trailing_stop_pct = 0.25
+
+[strategy.tailrider]
+# Config #1 — the locked power-law tail-rider. Read by src/memebot/live/run.py.
+# These SUPERSEDE [risk_governor] for the live engine. Defaults reproduce the backtest #1.
+dip_trigger      = 0.50    # enter at (1 - 0.50)*sig = a -50% dip from the signal price
+dip_window_h     = 48      # give up if the dip doesn't arrive within 48h
+stop_level_mult  = 0.70    # hard stop at 0.70x entry = -30% from entry, PRE-SECURE ONLY
+stop_cost        = 0.05
+tp1_mult         = 3.00    # secure rung: sell 33% at 3x, then REMOVE the stop
+tp1_sell_frac    = 0.33
+ride_sell_frac   = 0.25    # sell 25% of the remainder at each subsequent rung
+ride_step_x2     = 5       # rungs 3/6/12/24/48 use x2 steps; after 5 TPs switch to x3
+tp_cost          = 0.015
+reentry          = false
+poll_interval_s  = 1.0     # price poll cadence (s). Measured 2026-07-02: this key = Jupiter free tier
+                           # (burst bucket 10, ~60 req/min sustained) -> 1.0s is the safe floor.
+                           # A paid Jupiter tier allows sub-second; keyless clamps to 1.1s in run.py.
+# sizing — small fixed stake by default (fraction mode available); size to YOUR risk tolerance
+bankroll_usd     = 500.0
+stake_mode       = "fixed" # "fixed" | "fraction"
+stake_usd        = 3.0
+stake_fraction   = 0.006   # used only in fraction mode (~$3 on $500, and it can't bust)
+max_concurrent   = 25      # LIVE-only safety cap (paper is uncapped to mirror the backtest)
+total_deployed_cap_usd = 200.0
+daily_loss_cap_usd     = 50.0
+mode             = "live"  # "paper" | "live"  (live is gated + inert until armed)
+exec_workers     = 8       # LIVE: concurrent execution workers (swaps for different mints in parallel)

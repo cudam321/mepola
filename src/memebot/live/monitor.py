@@ -69,12 +69,13 @@ class Assessment:
 class Monitor:
     def __init__(self, state: LiveState, expectation: Expectation, *,
                  feed_max_gap_s: float = 1800.0, win_tol: float = 0.10,
-                 listener_max_gap_s: float = 600.0):
+                 listener_max_gap_s: float = 600.0, recon_max_gap_s: float = 900.0):
         self.state = state
         self.exp = expectation
         self.feed_max_gap_s = feed_max_gap_s
         self.win_tol = win_tol
         self.listener_max_gap_s = listener_max_gap_s
+        self.recon_max_gap_s = recon_max_gap_s
 
     # -- expectation from the strategy's own realized distribution -------- #
     @classmethod
@@ -150,6 +151,23 @@ class Monitor:
                                "check @your_channel ingestion"}
         return None
 
+    # -- on-chain reconciler health (H7, audit 2026-07-07) ------------------ #
+    def check_recon(self, *, now: Optional[datetime] = None) -> Optional[dict]:
+        """The on-chain safety net (_reconcile_onchain) refreshes wallet_at every pass. If that
+        stamp goes stale the net is dead — a broken RPC would otherwise silently no-op it forever
+        while real bags trade uncovered. Checked HERE (the sampler loop) so a different task
+        raises the alarm than the one that died. None if wallet_at was never set (paper/dry)."""
+        last = from_iso(self.state.get_system("wallet_at"))
+        if last is None:
+            return None
+        gap = ((now or utcnow()) - last).total_seconds()
+        if gap > self.recon_max_gap_s:
+            return {"severity": "CRIT", "kind": "RECON_STALE",
+                    "message": f"on-chain reconciler stale {gap/60:.0f}m "
+                               f"(> {self.recon_max_gap_s/60:.0f}m) — the wallet/book safety net "
+                               "is not running; check RPC health"}
+        return None
+
     # -- path deviation ---------------------------------------------------- #
     @staticmethod
     def path_deviation(live_multiple: float, sim_multiple: float, *, tol: float = 1e-3) -> Optional[dict]:
@@ -162,6 +180,40 @@ class Monitor:
                     "message": f"live {live_multiple:.4f} vs modeled {sim_multiple:.4f}"}
         return None
 
+    # non-manual algo closes only — a human override legitimately diverges from the sim
+    _ALGO_CLOSE_SQL = ("c.close_reason NOT IN ('manual_close','manual_stop','dead_writeoff',"
+                       "'manual_close_reconciled','crash_gap_reconciled')")
+
+    def check_path(self, *, tol: float = 0.25) -> list[dict]:
+        """F03 (wired 2026-07-07): every NEW closed LIVE algo trade is compared against the
+        shadow C1 rider's sim result on the SAME ticks. Real fills differ from the sim's fill
+        model by slippage, so the tolerance is loose (25%) — this catches gross path divergence
+        (a missed stop, a wrong rung count, a booking bug), not fill noise. Incremental via a
+        persisted closed_trades high-water."""
+        last = int(self.state.get_system("path_check_close_id") or 0)
+        rows = self.state.query(
+            "SELECT c.id, c.mint, c.realized_multiple AS live_m, s.realized_multiple AS sim_m "
+            "FROM closed_trades c "
+            "JOIN shadow_trades s ON s.mint = c.mint AND s.config_id = 'C1' "
+            "JOIN seen_mints sm ON sm.mint = c.mint AND sm.outcome != 'seen' "
+            f"WHERE c.id > ? AND c.realized_multiple IS NOT NULL "
+            f"AND s.realized_multiple IS NOT NULL AND {self._ALGO_CLOSE_SQL} "
+            "ORDER BY c.id LIMIT 50", (last,))
+        out: list[dict] = []
+        hi = last
+        for r in rows:
+            hi = max(hi, r["id"])
+            dev = self.path_deviation(r["live_m"], r["sim_m"], tol=tol)
+            if dev:
+                dev = dict(dev, severity="WARN",
+                           message=f"{r['mint'][:6]}… closed live at {r['live_m']:.3f}x but the "
+                                   f"C1 sim twin says {r['sim_m']:.3f}x on the same ticks "
+                                   "(>25% apart) — check fills/booking for this position")
+                out.append(dev)
+        if hi != last:
+            self.state.set_system("path_check_close_id", str(hi))
+        return out
+
     # -- run one monitoring pass, write alerts ----------------------------- #
     def run_once(self, *, now: Optional[datetime] = None) -> Assessment:
         now = now or utcnow()
@@ -169,8 +221,12 @@ class Monitor:
         assessment = self.assess(live)
         prev = self.state.get_system("live_status")
         self.state.set_system("live_status", assessment.status)
+        # transition-gated like the listener/recon checks (re-audit: an ungated write every 30s
+        # floods the alerts table for the length of the outage; notify's throttle re-pages anyway)
         feed = self.check_feed(now=now)
-        if feed:
+        prev_f = self.state.get_system("feed_ok")
+        self.state.set_system("feed_ok", "stale" if feed else "ok")
+        if feed and prev_f != "stale":
             self.state.record_alert(**feed, ts=now)
         # listener staleness (audit #9): alert only on the transition into 'stale' (no 30s storm)
         listener = self.check_listener(now=now)
@@ -178,6 +234,18 @@ class Monitor:
         self.state.set_system("listener_ok", "stale" if listener else "ok")
         if listener and prev_l != "stale":
             self.state.record_alert(**listener, ts=now)
+        # dead on-chain reconciler (H7): transition-gated like the listener check
+        recon = self.check_recon(now=now)
+        prev_r = self.state.get_system("recon_ok")
+        self.state.set_system("recon_ok", "stale" if recon else "ok")
+        if recon and prev_r != "stale":
+            self.state.record_alert(**recon, ts=now)
+        # per-trade path deviation vs the C1 sim twin (F03) — each trade checked once
+        try:
+            for dev in self.check_path():
+                self.state.record_alert(**dev, ts=now)
+        except Exception:
+            pass    # shadow tables may not exist on a bare dev DB — never break the pass
         # Alert only on a TRANSITION into off_expectation (no 30s re-alert storm), and only
         # when the band is real — a degenerate zero-width band built from <5 seed rows must
         # never fire on a merely-positive live mean.

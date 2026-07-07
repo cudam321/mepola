@@ -32,7 +32,7 @@ SWAP_BASE = "https://lite-api.jup.ag/swap/v1"
 LAMPORTS_PER_SOL = 1_000_000_000
 
 # The ONE wallet this bot may ever sign with (F09). load_burner_keypair fails closed if the loaded
-# key's pubkey is anything else — the belt-and-braces against funding/using a compromised key.
+# key's pubkey is anything else — the belt-and-braces against ever signing with the wrong wallet.
 # Set MEMEBOT_BURNER_PUBKEY to your burner's public key; unset = no key can ever load (fail closed).
 EXPECTED_BURNER_PUBKEY = os.environ.get("MEMEBOT_BURNER_PUBKEY", "")
 
@@ -43,6 +43,14 @@ class SwapResult:
     in_amount: int          # ACTUAL raw units of input mint moved (from the landed tx), 0 if unknown
     out_amount: int         # ACTUAL raw units of output mint received (from the landed tx), 0 if unknown
     confirmed: bool
+    # Owner's raw balance of the TOKEN side AFTER the tx, from the confirmed tx's
+    # postTokenBalances — the authoritative wallet state at that slot, immune to RPC read
+    # lag (the lagged-read class). -1 = unknown/unparsed (0 is a real balance).
+    post_balance: int = -1
+    # The tx fee actually paid (base + priority), from meta.fee. Booked cumulatively so
+    # ~$0.3-0.6/position of unbooked cost can't slow-drift the wallet==book invariant (M2).
+    # (ATA rent deposits are excluded — locked, recoverable value, not a cost.)
+    fee_lamports: int = 0
 
 
 class JupiterSwap:
@@ -99,13 +107,16 @@ class JupiterSwap:
         sig = self._rpc("sendTransaction", [wire, {"encoding": "base64", "skipPreflight": False,
                                                    "maxRetries": 3}])
         confirmed = self._confirm(sig)
-        in_amt = out_amt = 0
+        in_amt = out_amt = fee = 0
+        post_bal = -1
         if confirmed and owner_pubkey and input_mint and output_mint:
             try:
-                in_amt, out_amt = self.landed_amounts(sig, owner_pubkey, input_mint, output_mint)
+                in_amt, out_amt, post_bal, fee = self.landed_amounts_full(
+                    sig, owner_pubkey, input_mint, output_mint)
             except Exception:
                 pass    # confirmed but couldn't parse -> caller reconciles via token_balance
-        return SwapResult(signature=sig, in_amount=in_amt, out_amount=out_amt, confirmed=confirmed)
+        return SwapResult(signature=sig, in_amount=in_amt, out_amount=out_amt,
+                          confirmed=confirmed, post_balance=post_bal, fee_lamports=fee)
 
     def _rpc(self, method: str, params: list):
         try:
@@ -175,17 +186,26 @@ class JupiterSwap:
     def token_balance(self, owner_pubkey: str, mint: str) -> int:
         """Raw token amount the owner currently holds of `mint` (summed across token accounts).
         0 if none. The real remaining-bag figure that sizes sells + gates the idempotent buy."""
+        return self.token_balance_ex(owner_pubkey, mint)[0]
+
+    def token_balance_ex(self, owner_pubkey: str, mint: str) -> tuple[int, int]:
+        """(raw_total, n_accounts). n_accounts=0 means the RPC node sees NO token account for
+        this mint — on a node that hasn't indexed a fresh ATA yet that is indistinguishable from
+        'never held', so a sell must treat total=0 WITH no account as AMBIGUOUS, never as proof a
+        prior sell landed (the phantom-stop incident booked a $0 stop-out off exactly that misread).
+        An account that EXISTS with a low/zero balance is a real answer."""
         res = self._rpc("getTokenAccountsByOwner",
                         [owner_pubkey, {"mint": mint}, {"encoding": "jsonParsed"}])
+        vals = (res or {}).get("value") or []
         total = 0
-        for acc in (res or {}).get("value") or []:
+        for acc in vals:
             amt = ((((acc.get("account") or {}).get("data") or {}).get("parsed") or {})
                    .get("info") or {}).get("tokenAmount") or {}
             try:
                 total += int(amt.get("amount") or 0)
             except (TypeError, ValueError):
                 continue
-        return total
+        return total, len(vals)
 
     def landed_amounts(self, signature: str, owner_pubkey: str,
                        input_mint: str, output_mint: str) -> tuple[int, int]:
@@ -193,8 +213,38 @@ class JupiterSwap:
         pre/post token balances; a WSOL side (wrapped/unwrapped to SOL) comes from the owner's
         NET lamport delta — so a sell's real SOL proceeds (net of fees) are captured, not 0 (F4).
         Best-effort: returns 0 for a side it can't parse."""
-        tx = self._rpc("getTransaction",
-                       [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+        in_raw, out_raw, _ = self.landed_amounts_ex(signature, owner_pubkey,
+                                                    input_mint, output_mint)
+        return in_raw, out_raw
+
+    def landed_amounts_ex(self, signature: str, owner_pubkey: str,
+                          input_mint: str, output_mint: str) -> tuple[int, int, int]:
+        """(in_raw, out_raw, token_post_balance_raw) — see landed_amounts_full."""
+        in_raw, out_raw, post_bal, _fee = self.landed_amounts_full(
+            signature, owner_pubkey, input_mint, output_mint)
+        return in_raw, out_raw, post_bal
+
+    def landed_amounts_full(self, signature: str, owner_pubkey: str,
+                            input_mint: str, output_mint: str) -> tuple[int, int, int, int]:
+        """(in_raw, out_raw, token_post_balance_raw, fee_lamports). The third value is the owner's
+        balance of the TOKEN side (whichever of input/output is not WSOL) AFTER the tx — the
+        authoritative wallet state at that slot, immune to read-lag on load-balanced RPC (the
+        lagged-read class); -1 if it can't be parsed (0 is a real balance). fee_lamports is the tx
+        fee actually paid (meta.fee — M2 cost booking).
+
+        H1 (audit 2026-07-07): getTransaction defaults to FINALIZED while _confirm returns at
+        CONFIRMED — without an explicit commitment the parse routinely returned null → (0,0,-1),
+        proceeds booked from the QUOTE and the post-balance defense layer sat inert. Ask at
+        "confirmed" and retry briefly (the tx can lag the status by a beat even at confirmed)."""
+        import time
+        tx = None
+        for attempt in range(5):
+            tx = self._rpc("getTransaction",
+                           [signature, {"encoding": "jsonParsed", "commitment": "confirmed",
+                                        "maxSupportedTransactionVersion": 0}])
+            if tx is not None:
+                break
+            time.sleep(1.0 + attempt)   # 1,2,3,4s — ~10s total, well inside a leg's budget
         meta = (tx or {}).get("meta") or {}
         pre = meta.get("preTokenBalances") or []
         post = meta.get("postTokenBalances") or []
@@ -225,7 +275,13 @@ class JupiterSwap:
                    else max(0, _held(post, output_mint) - _held(pre, output_mint)))
         in_raw = (0 if input_mint == WSOL
                   else max(0, _held(pre, input_mint) - _held(post, input_mint)))
-        return in_raw, out_raw
+        token_mint = output_mint if input_mint == WSOL else input_mint
+        post_bal = _held(post, token_mint) if (tx or {}).get("meta") else -1
+        try:
+            fee = int(meta.get("fee") or 0)
+        except (TypeError, ValueError):
+            fee = 0
+        return in_raw, out_raw, post_bal, fee
 
 
 def load_burner_keypair():

@@ -31,7 +31,7 @@ _STOP_KINDS = ("stop_loss", "trailing_stop")
 # gate/price/in-flight -> retry). Must match the strings engine.manual_sell / direct_buy return.
 _TERMINAL_REASONS = ("no open position to sell", "nothing held", "already holding",
                      "position already closed", "already closed", "direct buys disabled",
-                     "averaging-in")
+                     "averaging-in", "sell amount too small")   # dust can never grow — cancel
 
 
 class OrderBook:
@@ -90,11 +90,14 @@ class OrderBook:
         live: list[dict] = []
         for o in orders:
             exp = from_iso(o["expires_at"]) if o.get("expires_at") else None
-            if exp and now > exp:
-                self.state.update_order(o["id"], status="expired",
-                                        note="expired (order window passed)")
-            else:
-                live.append(o)
+            # re-audit: never expire a 'submitted' (in-flight) order — stamping it 'expired'
+            # mid-swap would break the failure-retry path (claim submitted->open misses) and
+            # lie about a swap that may land. CAS from 'open' only.
+            if exp and now > exp and o["status"] == "open":
+                if self.state.claim_order(o["id"], "open", "expired",
+                                          note="expired (order window passed)"):
+                    continue
+            live.append(o)
         return live
 
     @staticmethod
@@ -106,28 +109,38 @@ class OrderBook:
     def _evaluate(self, order: dict, candle: Candle, pos: Optional[dict]) -> Optional[float]:
         """Return the modeled fill price if `order` triggers on this candle, else None."""
         tt, tv = order["trigger_type"], order["trigger_value"]
-        hi, lo, close = candle.high, candle.low, candle.close
+        o, hi, lo, close = candle.open, candle.high, candle.low, candle.close
+        # Modeled fills are clamped to what the bar could actually give (re-audit): a trigger
+        # already passed at the OPEN fills at the open, never at an off-market trigger price —
+        # else a stop set 10x above market books paper proceeds at a price that never traded.
         if tt == "now":
             return close
         if tt == "price_at_or_below":
-            return tv if (tv is not None and lo <= tv) else None
+            return min(tv, o) if (tv is not None and lo <= tv) else None
         if tt == "price_at_or_above":
-            return tv if (tv is not None and hi >= tv) else None
+            return max(tv, o) if (tv is not None and hi >= tv) else None
         if tt == "mult_at_or_above":
             entry = (pos or {}).get("entry_price")
             if not entry or tv is None:
                 return None
             level = tv * entry
-            return level if hi >= level else None
+            return max(level, o) if hi >= level else None
         if tt == "peak_drawdown_pct":
             if not pos or not pos.get("entry_price") or tv is None:
                 return None
-            base = order.get("hwm") or pos.get("peak_price") or pos.get("entry_price") or 0.0
+            # M10 (audit 2026-07-07): a FRESH trailing stop arms from the CURRENT price, never
+            # the position's all-time peak — seeding from peak_price on a token already far off
+            # its high would market-dump the full bag the instant the order is placed. First
+            # candle seeds the watermark; the trail fires from the next candle on.
+            if order.get("hwm") is None:
+                self.state.update_order(order["id"], hwm=close)
+                return None
+            base = order["hwm"]
             new_hwm = max(base, hi)
-            if new_hwm > (order.get("hwm") or 0.0):
+            if new_hwm > base:
                 self.state.update_order(order["id"], hwm=new_hwm)
             level = new_hwm * (1.0 - tv)
-            return level if lo <= level else None
+            return min(level, o) if lo <= level else None    # gapped-below fills at the open
         return None
 
     def _fire(self, order: dict, fill_price: float, ts, pos: Optional[dict]) -> None:

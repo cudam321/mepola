@@ -38,7 +38,6 @@ def main() -> int:
     ap.add_argument("--out", default="/tmp/demo_state.db")
     args = ap.parse_args()
 
-    src = sqlite3.connect(str(ROOT / "runs" / "live_state.db"))
     dst_path = Path(args.out)
     # audit #33: this helper UNLINKS --out. Never let it clobber the real live DB (its own backup
     # source) or any *.db under runs/ — the docstring bills it as "never touches the real DB".
@@ -48,10 +47,15 @@ def main() -> int:
         raise SystemExit(f"refusing to overwrite a real DB under runs/: {dst_path} — use a temp path")
     if dst_path.exists():
         dst_path.unlink()
-    dst = sqlite3.connect(str(dst_path))
-    src.backup(dst)
-    src.close()
-    dst.close()
+    # Start from the schema LiveState itself creates (a fresh clone has no runs/ DB) and,
+    # when a local live DB exists, clone it first so the demo carries its full shape.
+    src_db = ROOT / "runs" / "live_state.db"
+    if src_db.exists():
+        src = sqlite3.connect(str(src_db))
+        dst = sqlite3.connect(str(dst_path))
+        src.backup(dst)
+        src.close()
+        dst.close()
 
     st = LiveState(dst_path)
 

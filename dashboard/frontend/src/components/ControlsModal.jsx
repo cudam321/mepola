@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { currentBook, withBook } from "../api";
 
 // Runtime controls: the ONLY editable knobs are sizing/risk + the kill switch.
 // Strategy parameters are research-locked server-side — shown read-only here on purpose.
@@ -20,7 +21,7 @@ async function postControl(key, value) {
   const r = await fetch("/api/control", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ key, value }),
+    body: JSON.stringify({ key, value, book: currentBook() }),
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || `save failed (${r.status})`);
@@ -136,7 +137,7 @@ export default function ControlsModal({ onClose }) {
   const [killErr, setKillErr] = useState(null);
 
   useEffect(() => {
-    fetch("/api/control")
+    fetch(withBook("/api/control"))
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("bad status"))))
       .then(setCtl)
       .catch(() => setLoadErr("failed to load /api/control"));

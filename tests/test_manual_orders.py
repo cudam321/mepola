@@ -172,3 +172,61 @@ def test_takeover_deferred_while_swap_in_flight(tmp_path):
         assert MINT not in orch.engine.riders and MINT in orch.engine.manual_pids
     finally:
         orch.state.close()
+
+
+def test_release_fast_forwards_the_ladder_no_catchup_sells(tmp_path):
+    """ladder-replay incident (2026-07-07): releasing a SECURED manual position whose price
+    sits far above the next rung must NOT replay the missed rungs at market — the ladder
+    resumes ABOVE the current price and nothing sells until a NEW high."""
+    orch = _paper_orch(tmp_path / "s.db")
+    try:
+        orch.engine.direct_buy(MINT, usd=10.0, price=1.0, ticker="TOK")
+        orch.engine.manual_sell(MINT, price=2.0, sell_frac=0.25)          # -> manual controller
+        # a secured bag whose ladder state was lost (NULL next rung), price now 40x entry
+        orch.state.update_position(MINT, secured=1, n_tp=1, next_rung_mult=None,
+                                   current_price=40.0)
+        orch.state.update_position(MINT, controller="algo")
+        orch.state.set_system("controller_rev",
+                              str(int(orch.state.get_system("controller_rev") or "0") + 1))
+        orch._reconcile_controllers()
+        tr = orch.engine.riders[MINT]
+        assert tr.lvl * tr.entry > 40.0                    # ladder resumed ABOVE the market
+        rem_before = orch.state.get_position(MINT)["remaining_frac"]
+        orch.engine.on_candle(MINT, _c(2, 40.0, 40.0, 39.0, 40.0))
+        assert orch.state.get_position(MINT)["remaining_frac"] == rem_before   # no catch-up sell
+        evs = orch.state.query("SELECT event_type FROM position_events WHERE mint=?", (MINT,))
+        assert "RIDE_SELL" not in [e["event_type"] for e in evs]
+    finally:
+        orch.state.close()
+
+
+# -- H3 (audit 2026-07-07): cancel/fire compare-and-swap across processes ------------ #
+def test_cancelled_order_never_fires_even_from_a_stale_snapshot(tmp_path):
+    """The dashboard (another process) cancels between the engine's open_orders read and the
+    fire — the status claim must make the cancel win."""
+    st, eng, ob = _setup(tmp_path)
+    eng.direct_buy(MINT, usd=10.0, price=1.0, ticker="TOK")
+    oid = st.create_order(mint=MINT, kind="stop_loss", side="sell",
+                          trigger_type="price_at_or_below", trigger_value=0.7,
+                          size_kind="token_frac", size_value=1.0)
+    st.claim_order(oid, "open", "cancelled", note="cancelled by user")   # user got there first
+    ok, msg = eng.manual_sell(MINT, price=0.65, order_id=oid, is_stop=True, close=True)
+    assert not ok and "no longer open" in msg
+    assert st.get_order(oid)["status"] == "cancelled"
+    assert st.get_position(MINT)["remaining_frac"] in (None, 1.0)        # nothing sold
+    st.close()
+
+
+def test_claim_order_cas_semantics(tmp_path):
+    st, eng, ob = _setup(tmp_path)
+    oid = st.create_order(mint=MINT, kind="stop_loss", side="sell",
+                          trigger_type="price_at_or_below", trigger_value=0.7,
+                          size_kind="token_frac", size_value=1.0)
+    assert st.claim_order(oid, "open", "submitted")          # first claim wins
+    assert not st.claim_order(oid, "open", "cancelled")      # a stale cancel loses
+    assert st.get_order(oid)["status"] == "submitted"
+    # the in-flight failure reset respects a cancel that happened during the flight
+    assert st.claim_order(oid, "submitted", "cancelled", note="cancelled by user")
+    assert not st.claim_order(oid, "submitted", "open", note="retrying after failure")
+    assert st.get_order(oid)["status"] == "cancelled"        # NOT resurrected
+    st.close()

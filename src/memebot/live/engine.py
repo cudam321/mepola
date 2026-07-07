@@ -53,6 +53,8 @@ class LiveEngine:
         self.manual_pids: dict[str, int] = {}
         self._manual_pending: dict[str, dict] = {}
         self._dead_finalize_fails: dict[str, int] = {}   # audit #7: consecutive unroutable FINALIZEs
+        self._dead_manual_tries: dict[str, int] = {}     # H5: real-swap attempts before a manual writeoff
+        self._sells_blocked_alerted = False              # M1: page once when gates block a stop
         self._algo_fail_seen: set[str] = set()           # audit #16: alert-once-per-mint on algo fail
         # in-flight (submitted-but-unconfirmed) BUY notionals per mint — counted by can_enter so the
         # deployed/concurrency caps hold under a one-sweep correlated dip (audit re-verify #1/#2).
@@ -115,10 +117,29 @@ class LiveEngine:
                              outcome="positioned")
         tr = TailRider(cfg=self.cfg, sig=price, t0=now.timestamp())
         deadline = now + timedelta(hours=self.cfg.dip_window_h)
-        pid = self.state.create_position(mint=sig.mint, ticker=sig.ticker, signal_at=now,
-                                         signal_price=price or 0.0, state="WATCHING",
-                                         dip_deadline=deadline, source_channel=sig.source_channel,
-                                         message_id=sig.message_id, t0_epoch=now.timestamp())
+        # re-audit #4 (M7 completion): a TERMINAL row can exist for an unseen mint — a failed
+        # direct buy that the reaper EXPIRED and then unmarked. positions.mint is UNIQUE, so a
+        # plain INSERT raises IntegrityError (losing the call and, from catch-up, wedging the
+        # replay). Reset the dead row back to WATCHING with the new signal's fields instead.
+        stale = self.state.get_position(sig.mint)
+        if (stale is not None and stale["state"] == "EXPIRED"
+                and (stale.get("close_reason") or "") == "never_entered"):
+            # only never-entered rows are reusable — a row with real trades keeps its history
+            pid = stale["id"]
+            self.state.update_position(
+                sig.mint, state="WATCHING", ticker=sig.ticker, signal_at=now.isoformat(),
+                signal_price=price or 0.0, dip_deadline=deadline.isoformat(),
+                t0_epoch=now.timestamp(), entry_at=None, entry_price=None, stake_usd=None,
+                tokens_qty=None, stop_price=None, remaining_frac=None, secured=0, n_tp=0,
+                next_rung_mult=None, next_rung_price=None, peak_price=None, current_price=price,
+                current_multiple=None, realized_multiple=None, realized_pnl_usd=None,
+                closed_at=None, close_reason=None, controller="algo")
+        else:
+            pid = self.state.create_position(mint=sig.mint, ticker=sig.ticker, signal_at=now,
+                                             signal_price=price or 0.0, state="WATCHING",
+                                             dip_deadline=deadline,
+                                             source_channel=sig.source_channel,
+                                             message_id=sig.message_id, t0_epoch=now.timestamp())
         self.state.append_event(position_id=pid, mint=sig.mint, ts=now, event_type="SIGNAL",
                                 price=price, note="first-call BUY -> WATCHING")
         self.riders[sig.mint] = tr
@@ -238,8 +259,22 @@ class LiveEngine:
         e = exec_events[0]
         side = "buy" if e.kind == "ENTER" else "sell"
         if not self._can_send_live(side):
+            # M1 (audit 2026-07-07): a blocked SELL means every stop is dead while the operator
+            # gates/mode stay unset — that must PAGE, not silently retry each candle. Alerted on
+            # the transition only; cleared when a sell goes through again.
+            if side == "sell" and not self._sells_blocked_alerted:
+                self._sells_blocked_alerted = True
+                try:
+                    self.state.record_alert(
+                        severity="CRIT", kind="SELLS_DISABLED",
+                        message=f"a live SELL for {mint[:6]}… was blocked by mode/arming/gates — "
+                                "ALL stops are disabled while this holds; restore the gates")
+                except Exception:
+                    pass
             self._rollback(mint)                 # not armed / gated — stay confirmed, retry next candle
             return
+        if side == "sell" and self._sells_blocked_alerted:
+            self._sells_blocked_alerted = False
         pos = self.state.get_position(mint) or {}
         stake = self.risk.size_for(self._realized_equity()) if e.kind == "ENTER" \
             else (pos.get("stake_usd") or self.risk.size_for())
@@ -330,8 +365,13 @@ class LiveEngine:
                 self._algo_fail_seen.add(mint)
                 try:
                     kind = result.legs[0].event.kind if result.legs else "swap"
+                    # a raw RPC error repr can be a 7KB program-log dump — alert with the
+                    # headline only (the full text is in the engine log / orders.note)
+                    err = str(result.error or "")
+                    if len(err) > 300:
+                        err = err[:300].rstrip() + " … [truncated]"
                     self.state.record_alert(severity="WARN", kind="ALGO_ORDER_FAILED",
-                                            message=f"algo {kind} {mint[:6]}… failed: {result.error} "
+                                            message=f"algo {kind} {mint[:6]}… failed: {err} "
                                                     "— retrying next tick")
                 except Exception:
                     pass
@@ -341,6 +381,12 @@ class LiveEngine:
         """Audit #7: close a rugged/unroutable algo position with NO swap (mirror finalize_manual).
         Value the residual at last_price (~0 for a dead token), book the real (~total) loss, free the
         slot + budget, and alert. Reached only after repeated FINALIZE-swap failures = true unsellability."""
+        # AUDIT B3 (2026-07-07): the rider reaching this point is the OPTIMISTICALLY-advanced one
+        # (tr.finalize already ran for the failed job: rem=0, terminal) because the 3rd failure
+        # returns before the rollback. Writing off from it values the residual at $0, appends NO
+        # finalize event, and the dead_writeoff tag then suppresses the orphan alert for a bag that
+        # may be worth real money. Restore the last CONFIRMED state first, then write off honestly.
+        self._rollback(mint)
         tr = self.riders.get(mint)
         if tr is None:
             self._dead_finalize_fails.pop(mint, None)
@@ -534,6 +580,11 @@ class LiveEngine:
         ok, reason, pid = self._prepare_direct_buy_row(mint, price, ticker)
         if not ok:
             return False, reason
+        # H3: CLAIM the order (open -> submitted) before anything fires. The dashboard is a
+        # separate process — without the compare-and-swap, a user's just-written 'cancelled'
+        # is overwritten here and the cancelled order still buys.
+        if order_id and not self.state.claim_order(order_id, "open", "submitted"):
+            return False, "order no longer open (cancelled/claimed) — not fired"
         if self.pipeline is not None:                # LIVE — off-loop, confirm-then-commit
             self._pending.add(mint)
             self._pending_buy_usd[mint] = usd        # reserve this in-flight buy against the cap
@@ -542,8 +593,6 @@ class LiveEngine:
             self.state.append_event(position_id=pid, mint=mint, ts=ts,
                                     event_type="MANUAL_BUY_SUBMITTED", price=price,
                                     proceeds_usd=usd, note="direct buy submitted (awaiting confirm)")
-            if order_id:
-                self.state.update_order(order_id, status="submitted")
             self.pipeline.submit(ExecJob(
                 mint=mint, pid=pid, stake_usd=usd, entry_price=price,
                 events=[Event(ts, "ENTER", price=price, remaining_frac=1.0, note="direct buy")],
@@ -610,14 +659,15 @@ class LiveEngine:
         if self.pipeline is not None:                # LIVE
             if not self._can_send_live("sell"):
                 return False, "live sells not available (mode/arming/gates)"
+            # H3: claim before firing (see direct_buy) — a cancelled stop must never still sell
+            if order_id and not self.state.claim_order(order_id, "open", "submitted"):
+                return False, "order no longer open (cancelled/claimed) — not fired"
             self._pending.add(mint)
             self._manual_pending[mint] = {"op": "sell", "order_id": order_id, "is_stop": is_stop,
-                                          "note": note}
+                                          "note": note, "close": close}
             self.state.append_event(position_id=pos["id"], mint=mint, ts=ts,
                                     event_type="MANUAL_SELL_SUBMITTED", price=price,
                                     note="manual sell submitted (awaiting confirm)")
-            if order_id:
-                self.state.update_order(order_id, status="submitted")
             frac_orig = (sell_tok / tokens_qty) if tokens_qty else 0.0
             ev = Event(ts, "MANUAL_SELL", price=price, frac=frac_orig,
                        remaining_frac=max(0.0, rem - frac_orig))
@@ -630,6 +680,8 @@ class LiveEngine:
                 target_remaining_tokens=target_rem_tokens))
             return True, "submitted"
         # PAPER
+        if order_id and not self.state.claim_order(order_id, "open", "submitted"):
+            return False, "order no longer open (cancelled/claimed) — not fired"    # H3
         fill = self.executor.sell_manual(mint=mint, tokens=sell_tok, price=price, ts=ts)
         self._manual_book_sell(mint, pos["id"], fill, price, ts, order_id=order_id,
                                is_stop=is_stop, note=note)
@@ -652,10 +704,13 @@ class LiveEngine:
                                    realized_pnl_usd=stake * (cm - 1.0))
 
     def finalize_manual(self, mint: str, last_price: float, ts: Optional[datetime] = None) -> None:
-        """Close a dead/illiquid MANUAL position by valuing its residual bag at last_price (review
-        M4). A rugged token is unsellable, so no on-chain swap can recover it — this books the honest
-        loss (residual valued at last_price, ~0 for a dead token), mirroring the algo's finalize, and
-        frees the exposure the lingering row was holding."""
+        """Close a dead/illiquid MANUAL position (review M4) so it can't linger holding cap/equity.
+
+        H5 (audit 2026-07-07): on a LIVE book this must first attempt the REAL swap — booking
+        held×price with no swap invents proceeds the wallet never received (a token flagged dead
+        with a residual price would print fictional realized P&L). Only after repeated failed
+        real-swap attempts (truly unroutable = rugged) is the residual written off with no swap,
+        mirroring the algo's _dead_writeoff, with a WARN so the operator can verify on-chain."""
         ts = ts or utcnow()
         pos = self.state.get_position(mint)
         if pos is None or pos.get("controller") != "manual" or pos["state"] not in _MANUAL_ACTIVE:
@@ -667,14 +722,45 @@ class LiveEngine:
         if held <= _MANUAL_DUST:
             return
         price = last_price if last_price and last_price > 0 else 0.0
+        if self.pipeline is not None:                       # LIVE: try to actually sell it
+            tries = self._dead_manual_tries.get(mint, 0)
+            if tries < 3 and price > 0:
+                if not self._can_send_live("sell"):
+                    # re-audit #2: gates/mode down must DEFER, not skip straight to a no-swap
+                    # writeoff with phantom held×price proceeds — sells will come back (M1
+                    # already pages SELLS_DISABLED); the dead-check retries.
+                    return
+                self._dead_manual_tries[mint] = tries + 1
+                ok, msg = self.manual_sell(mint, price=price, ts=ts, close=True,
+                                           note="dead/illiquid finalize (real swap)")
+                if ok:
+                    return               # confirmed proceeds book through _apply_manual_result
+                log.info("dead manual finalize swap for %s not fired (%s) — attempt %d/3",
+                         mint, msg, tries + 1)
+                return                   # the dead-check retries; write off only after 3 tries
+            try:
+                self.state.record_alert(
+                    severity="WARN", kind="DEAD_MANUAL_WRITEOFF",
+                    message=f"{mint[:6]}… manual bag written off with NO swap after "
+                            f"{tries} failed sell attempts (residual {held:.6g} tokens at "
+                            f"{price:.8g}) — verify on-chain")
+            except Exception:
+                pass
+        self._dead_manual_tries.pop(mint, None)
         fill = Fill(mint, "SELL", price, held, held * price, ts=ts, note="dead/illiquid finalize")
+        # close_reason=dead_writeoff so the orphan backstop treats the residue as KNOWN
+        # (mirrors the algo path) instead of CRIT-ing every 6 minutes forever
         self._manual_book_sell(mint, pos["id"], fill, price, ts, is_stop=False,
-                               note="dead/illiquid finalize")
+                               note="dead/illiquid finalize", close_reason="dead_writeoff")
 
     # -- manual apply (ON THE LOOP) + booking ------------------------------ #
     def _apply_manual_result(self, result: FillResult) -> None:
         mint, meta = result.mint, self._manual_pending.pop(result.mint, {})
         order_id = result.order_id
+        # M5 (audit 2026-07-07): a manual fill invalidates any candle buffered for the algo path —
+        # re-feeding a stale bar hours later would merge its extremes with a fresh entry's and
+        # fire a phantom instant stop/TP.
+        self._buffered.pop(mint, None)
         if not result.ok:
             log.warning("manual %s job for %s failed: %s — resetting to retry",
                         meta.get("op"), mint, result.error)
@@ -684,8 +770,11 @@ class LiveEngine:
                 # Reset to 'open' so the OrderBook retries it next candle (mirrors the algo's
                 # rollback-and-retry). The consecutive-failure breaker bounds buy retries (it trips
                 # the kill-switch, which blocks buys); risk-reducing SELLS keep retrying to protect.
-                self.state.update_order(order_id, status="open",
-                                        note=(f"retrying after failure: {result.error}")[:200])
+                # H3: compare-and-swap — if the user CANCELLED while the swap was in flight, the
+                # reset must not resurrect the order.
+                if not self.state.claim_order(order_id, "submitted", "open",
+                                              note=(f"retrying after failure: {result.error}")[:200]):
+                    log.info("order %s was cancelled while in flight — not resurrecting", order_id)
             try:
                 self.state.record_alert(severity="WARN", kind="MANUAL_ORDER_FAILED",
                                         message=f"manual {meta.get('op','order')} {mint[:6]}… failed "
@@ -704,7 +793,8 @@ class LiveEngine:
         else:
             price = result.current_price or fill.price
             self._manual_book_sell(mint, result.pid, fill, price, ts, order_id=order_id,
-                                   is_stop=meta.get("is_stop", False), note=meta.get("note", ""))
+                                   is_stop=meta.get("is_stop", False), note=meta.get("note", ""),
+                                   force_close=meta.get("close", False))
 
     def _direct_buy_book(self, mint, pid, fill: Fill, ts: datetime, *, order_id=None,
                          ticker=None, note="") -> None:
@@ -740,7 +830,8 @@ class LiveEngine:
             pass
 
     def _manual_book_sell(self, mint, pid, fill: Fill, price: float, ts: datetime, *,
-                          order_id=None, is_stop=False, note="") -> None:
+                          order_id=None, is_stop=False, note="", force_close=False,
+                          close_reason: Optional[str] = None) -> None:
         pos = self.state.get_position(mint) or {}
         entry = pos.get("entry_price") or 0.0
         tokens_qty = pos.get("tokens_qty") or 0.0
@@ -751,11 +842,28 @@ class LiveEngine:
         frac_orig = min((sold / tokens_qty) if tokens_qty > 0 else 0.0, rem)
         pr_new = pr + (usd / tokens_qty if tokens_qty > 0 else 0.0)
         rem_new = max(0.0, rem - frac_orig)
+        # H5 (audit 2026-07-07): a CLOSE dumped everything the wallet actually held. If the fill
+        # is smaller than the book's bag (operator sold some externally), the difference is a
+        # PHANTOM — leaving the position open on it would mark ghost tokens forever. Close it,
+        # book only the real proceeds, and tell the operator the book and wallet had diverged.
+        if force_close and rem_new > _MANUAL_DUST:
+            try:
+                self.state.record_alert(
+                    severity="WARN", kind="EXTERNAL_SELL_RECONCILED",
+                    message=f"{mint[:6]}… close sold {sold:.6g} tokens but the book expected "
+                            f"{rem * tokens_qty:.6g} — the difference was not in the wallet "
+                            "(external sell?); position closed on real proceeds")
+            except Exception:
+                pass
+            frac_orig, rem_new = rem, 0.0
         peak = max(pos.get("peak_price") or 0.0, price or 0.0)
         self.state.append_event(position_id=pid, mint=mint, ts=ts, event_type="MANUAL_SELL",
                                 price=price, frac=frac_orig, proceeds_usd=usd,
                                 remaining_frac=rem_new, note=note or fill.note or "manual sell")
-        if rem_new <= _MANUAL_DUST and (sold > _MANUAL_DUST or usd > 0):
+        # re-audit #1: force_close alone is sufficient to CLOSE — a close whose fill was a $0
+        # idempotent skip (externally emptied bag) must not fall through to the open-position
+        # branch and leave a zombie (state ACTIVE, rem=0, no closed_trades row, unfreeable slot).
+        if rem_new <= _MANUAL_DUST and (sold > _MANUAL_DUST or usd > 0 or force_close):
             # REAL-dollar P&L (review M1): sum the ACTUAL proceeds booked across this position's
             # sell legs — for a taken-over algo position those legs carry real on-chain proceeds,
             # so pr/entry (which mixes the algo's MODELED pr) would misstate the realized dollars.
@@ -767,7 +875,7 @@ class LiveEngine:
             real_proceeds = float(prows[0]["p"] or 0.0)
             realized_mult = (real_proceeds / stake) if stake else ((pr_new / entry) if entry else 0.0)
             pnl = real_proceeds - stake
-            reason = "manual_stop" if is_stop else "manual_close"
+            reason = close_reason or ("manual_stop" if is_stop else "manual_close")
             st = "STOPPED" if is_stop else "EXITED"
             entry_at = from_iso(pos.get("entry_at"))
             held_h = ((ts - entry_at).total_seconds() / 3600.0) if entry_at else None
@@ -783,6 +891,7 @@ class LiveEngine:
                                     was_secured=bool(pos.get("secured")))   # L1: carry real ladder state
             self.risk.record_realized_pnl(pnl)
             self.manual_pids.pop(mint, None)
+            self._dead_manual_tries.pop(mint, None)       # H5: closed — retry counter is done
             self.riders.pop(mint, None)                   # audit #10: no algo rider may outlive a close
             self.pids.pop(mint, None)
             self._cancel_resting_orders(mint)             # a closed position cancels its resting orders

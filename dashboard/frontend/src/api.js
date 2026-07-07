@@ -44,7 +44,7 @@ export const manual = {
   modifyOrder: (id, fields) => jreq("PATCH", withBook(`/api/manual/order/${id}`), fields),
   injectSignal: (mint, ticker) => jreq("POST", "/api/signal", { mint, ticker, book: currentBook() }),
   lookup: (mint) => jreq("GET", `/api/lookup/${mint}`),
-  release: (mint) => jreq("POST", withBook(`/api/positions/${mint}/release`)),
+  release: (mint, body) => jreq("POST", withBook(`/api/positions/${mint}/release`), body),
   ordersFor: async (mint) => {
     const j = await jreq("GET", withBook("/api/manual/orders?status=open"));
     return (j.orders || []).filter((o) => o.mint === mint);

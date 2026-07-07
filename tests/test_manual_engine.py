@@ -347,3 +347,116 @@ def test_failed_override_order_resets_to_open_for_retry(tmp_path):
     eng.apply_fill_result(failed)
     assert st.get_order(oid)["status"] == "open"
     assert MINT not in eng._pending
+
+
+# -- H5 (audit 2026-07-07): external sells / dead-manual honesty --------------------- #
+def test_close_with_externally_shrunk_bag_closes_on_real_proceeds(tmp_path):
+    """The operator sold part of the bag from the burner directly. A CLOSE then fills fewer
+    tokens than the book expects — the position must CLOSE on the real proceeds, not stay
+    open marking a phantom bag."""
+    st, eng, pipe = _live_engine(tmp_path)
+    eng.direct_buy(MINT, usd=10.0, price=1.0, ticker="TOK"); _drain(pipe, eng)   # 10 tokens booked
+
+    class _HalfBagExec(_ManualFakeExec):
+        def sell_event(self, *, mint, stake_usd, entry_price, event, tokens_qty=None,
+                       target_remaining_tokens=None):
+            sold = 5.0                                    # wallet only actually held half
+            return Fill(mint, "SELL", event.price, sold, sold * event.price,
+                        ts=event.ts, note="fake sell (external sell shrank the bag)")
+
+    pipe.executor = _HalfBagExec()
+    eng.manual_sell(MINT, price=2.0, close=True); _drain(pipe, eng)
+    pos = st.get_position(MINT)
+    assert pos["state"] == "EXITED" and pos["remaining_frac"] == 0.0   # no phantom bag
+    assert pos["realized_pnl_usd"] == pytest.approx(5.0 * 2.0 - 10.0)  # real proceeds only
+    kinds = [a["kind"] for a in st.recent_alerts(10)]
+    assert "EXTERNAL_SELL_RECONCILED" in kinds
+    st.close()
+
+
+def test_dead_manual_finalize_attempts_real_swap_first(tmp_path):
+    """finalize_manual on a LIVE book must SELL (real proceeds), not invent held×price."""
+    st, eng, pipe = _live_engine(tmp_path)
+    eng.direct_buy(MINT, usd=10.0, price=1.0, ticker="TOK"); _drain(pipe, eng)
+    eng.manual_sell(MINT, price=1.0, sell_frac=0.1); _drain(pipe, eng)   # take over manually
+    assert st.get_position(MINT)["controller"] == "manual"
+
+    eng.finalize_manual(MINT, 0.5); _drain(pipe, eng)      # dead-flagged but still priced
+    pos = st.get_position(MINT)
+    assert pos["state"] == "EXITED"
+    # proceeds came through the REAL sell path (the fake exec), not a no-swap writeoff
+    ev = st.query("SELECT note FROM position_events WHERE mint=? AND event_type='MANUAL_SELL' "
+                  "ORDER BY id DESC LIMIT 1", (MINT,))[0]["note"]
+    assert "real swap" in ev
+    st.close()
+
+
+def test_dead_manual_writeoff_only_after_failed_attempts(tmp_path):
+    """Unroutable (sell path unavailable): three real-swap attempts, then an honest no-swap
+    writeoff with a WARN — never a silent held×price booking on the first pass."""
+    st, eng, pipe = _live_engine(tmp_path)
+    eng.direct_buy(MINT, usd=10.0, price=1.0, ticker="TOK"); _drain(pipe, eng)
+    eng.manual_sell(MINT, price=1.0, sell_frac=0.1); _drain(pipe, eng)
+
+    calls = {"n": 0}
+    real_manual_sell = eng.manual_sell
+
+    def failing_manual_sell(mint, **kw):
+        calls["n"] += 1
+        return False, "no route"
+    eng.manual_sell = failing_manual_sell
+
+    for _ in range(3):                                     # three dead ticks: all swap attempts
+        eng.finalize_manual(MINT, 0.5)
+        assert st.get_position(MINT)["state"] in ("ENTERED", "SECURED", "RIDING")
+    assert calls["n"] == 3
+    eng.manual_sell = real_manual_sell
+    eng.finalize_manual(MINT, 0.5)                         # 4th tick: honest writeoff — but via
+    _drain(pipe, eng)                                      # the real swap once more? no: tries==3
+    pos = st.get_position(MINT)
+    assert pos["state"] == "EXITED"
+    kinds = [a["kind"] for a in st.recent_alerts(10)]
+    assert "DEAD_MANUAL_WRITEOFF" in kinds
+    st.close()
+
+
+def test_force_close_with_zero_skip_fill_still_closes(tmp_path):
+    """Re-audit #1: a CLOSE whose executor fill is the legitimate $0 idempotent skip (bag
+    externally emptied, ATA visible at 0) must still CLOSE the position — not leave a zombie
+    holding a slot forever with rem=0 and no closed_trades row."""
+    st, eng, pipe = _live_engine(tmp_path)
+    eng.direct_buy(MINT, usd=10.0, price=1.0, ticker="TOK"); _drain(pipe, eng)
+
+    class _SkipExec(_ManualFakeExec):
+        def sell_event(self, *, mint, stake_usd, entry_price, event, tokens_qty=None,
+                       target_remaining_tokens=None):
+            return Fill(mint, "SELL", event.price, 0.0, 0.0, ts=event.ts,
+                        note="live sell skipped (already at/below target — idempotent)")
+
+    pipe.executor = _SkipExec()
+    eng.manual_sell(MINT, price=2.0, close=True); _drain(pipe, eng)
+    pos = st.get_position(MINT)
+    assert pos["state"] == "EXITED" and pos["remaining_frac"] == 0.0
+    assert len(st.closed_trades()) == 1               # realized from the summed real events
+    st.close()
+
+
+def test_expired_never_entered_row_is_reused_on_a_new_call(tmp_path):
+    """Re-audit #4 (M7 completion): after a failed direct buy is reaped + unmarked, a NEW call
+    for the same mint must re-enter WATCHING — not raise IntegrityError on the UNIQUE mint."""
+    from datetime import datetime, timezone
+    from memebot.models import Signal, SignalSide
+    st, eng = _engine(tmp_path)
+    pid = st.create_position(mint=MINT, ticker="TOK", signal_at=datetime.now(timezone.utc),
+                             signal_price=1.0, state="WATCHING")
+    st.update_position(MINT, state="EXPIRED", close_reason="never_entered")
+    st.unmark_failed_manual_seen(MINT)                # the reaper's M7 unmark
+
+    sig = Signal(source_channel="@c", message_id=9, posted_at=datetime.now(timezone.utc),
+                 raw_text="buy", side=SignalSide.BUY, mint=MINT, ticker="TOK",
+                 parse_confidence=1.0)
+    assert eng.ingest_call(sig, price=2.0)            # no IntegrityError
+    pos = st.get_position(MINT)
+    assert pos["state"] == "WATCHING" and pos["id"] == pid   # row reset, not duplicated
+    assert pos["signal_price"] == 2.0                 # re-anchored to the NEW call
+    st.close()

@@ -129,11 +129,18 @@ def hero_points(state: LiveState) -> list[dict]:
         if p["state"] in ("ENTERED", "SECURED", "RIDING") and p["current_multiple"] is not None:
             stake = p["stake_usd"] or 0.0
             entry, peak = p["entry_price"], p["peak_price"]
+            # incident lesson (2026-07-07): cash a position's sell legs have ALREADY returned is not a
+            # mark — banked/stake is a realized FLOOR the tiles may count (see _scope_stats).
+            banked = state.query(
+                "SELECT COALESCE(SUM(proceeds_usd),0) AS b FROM position_events "
+                "WHERE position_id=? AND event_type IN "
+                "('TP','RIDE_SELL','STOP_OUT','FINALIZE','MANUAL_SELL')", (p["id"],))[0]["b"]
             pts.append({
                 "mint": p["mint"], "ticker": p["ticker"] or p["mint"][:4],
                 "multiple": p["current_multiple"], "kind": "unrealized",
                 "source": "live" if _mint_is_live(p["mint"], lm) else "seed",
                 "pnl": stake * (p["current_multiple"] - 1.0), "stake": stake,
+                "banked_multiple": round(banked / stake, 4) if stake else None,
                 "state": p["state"], "n_tp": p["n_tp"],
                 # F52: a true multiple (peak/entry), matching the closed branch — NOT the raw price
                 "peak_multiple": round(peak / entry, 3) if (entry and peak) else None,
@@ -175,18 +182,31 @@ def account(state: LiveState) -> dict:
     today_realized = sum((c["pnl_usd"] or 0.0 for c in closed_today), 0.0)
 
     open_rows = state.query(
-        "SELECT mint,stake_usd,current_multiple,realized_pnl_usd,unrealized_pnl_usd,"
-        "remaining_frac,opened_at FROM positions WHERE state IN ('ENTERED','SECURED','RIDING')")
+        "SELECT id,mint,stake_usd,current_multiple,realized_pnl_usd,unrealized_pnl_usd,"
+        "remaining_frac,opened_at,tokens_qty,current_price "
+        "FROM positions WHERE state IN ('ENTERED','SECURED','RIDING')")
     live_open = [p for p in open_rows if _mint_is_live(p["mint"], lm)]
     # F43: config #1 sells 33% at 3x to RECOVER the stake while the position stays open. So
     # "deployed" is the remaining cost basis (stake * remaining_frac), not the full original
     # stake — a secured position that already returned its cash no longer ties up dry powder.
     deployed = sum(((p["stake_usd"] or 0.0) * (p["remaining_frac"] if p["remaining_frac"]
                     is not None else 1.0) for p in live_open), 0.0)
+    # M9 (audit 2026-07-07): the banked part of an open position comes from its EVENTS (real
+    # USD received), not the rider's modeled proceeds_units — a $0-skip/clamped leg otherwise
+    # overstates the balance until close (the exact divergence the incident repair hand-patched).
+    banked_by_pid = {r["position_id"]: float(r["b"] or 0.0) for r in state.query(
+        "SELECT position_id, COALESCE(SUM(proceeds_usd),0) AS b FROM position_events "
+        "WHERE event_type IN ('TP','RIDE_SELL','STOP_OUT','FINALIZE','MANUAL_SELL') "
+        "GROUP BY position_id")}
     unrealized = 0.0
     for p in live_open:
         stake = p["stake_usd"] or 0.0
-        if p["current_multiple"] is not None:
+        qty = p["tokens_qty"] or 0.0
+        rem = p["remaining_frac"] if p["remaining_frac"] is not None else 1.0
+        px = p["current_price"]
+        if qty > 0 and px is not None:
+            unrealized += banked_by_pid.get(p["id"], 0.0) + rem * qty * px - stake
+        elif p["current_multiple"] is not None:
             # current_multiple = (pr + rem*price)/entry -> total mark-to-market vs stake
             unrealized += stake * (p["current_multiple"] - 1.0)
         else:
@@ -227,9 +247,20 @@ def _scope_stats(points: list[dict], closed_rows: list[dict], now: datetime) -> 
     + CCDF, which intentionally display live bags. `n` is the closed count; `n_open` is split
     out so the tile denominator can be labelled accurately."""
     closed_pts = [p for p in points if p.get("kind") == "realized"]
+    # incident lesson (2026-07-07): banked cash is not a mark. An OPEN position whose SELL legs have
+    # already returned >= its stake contributes its banked-so-far multiple as a realized FLOOR
+    # (the number can only grow from there; the remaining bag rides on top). Without this the
+    # tiles said "best 0.71x / 0 wins" while ~38x the stake sat REALIZED in the wallet. F42's
+    # concern (a transient open MARK is not a win) is untouched — marks still don't count.
+    banked_pts = [dict(p, multiple=p["banked_multiple"],
+                       pnl=(p.get("stake") or 0.0) * (p["banked_multiple"] - 1.0))
+                  for p in points
+                  if p.get("kind") == "unrealized" and (p.get("banked_multiple") or 0) >= 1.0]
+    closed_pts = closed_pts + banked_pts
     mults = [p["multiple"] for p in closed_pts]
     n = len(mults)
-    out = {"n": n, "n_open": len(points) - n, "win_rate": None, "mean": None,
+    out = {"n": n, "n_banked": len(banked_pts),
+           "n_open": len(points) - n, "win_rate": None, "mean": None,
            "mean_ex_tail": None, "best": None, "hill_alpha": None,
            "top1_pnl_pct": None, "top3_pnl_pct": None, "bleed_rate": None,
            "total_loss_rate": None, "days_since_last_10x": None}

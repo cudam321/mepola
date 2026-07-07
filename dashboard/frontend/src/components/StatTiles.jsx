@@ -81,7 +81,11 @@ export default function StatTiles({ stats }) {
           <Tile
             label="win rate"
             value={`${(s.win_rate * 100).toFixed(1)}%`}
-            sub={`${s.n} closed trades`}
+            sub={
+              s.n_banked
+                ? `${s.n - s.n_banked} closed + ${s.n_banked} banked ≥1x`
+                : `${s.n} closed trades`
+            }
           />
           <Tile
             label="top-1 concentration"

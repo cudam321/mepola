@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import * as echarts from "echarts";
 import { igniteClass } from "../ignite";
-import { withBook } from "../api";
+import { currentBook, withBook } from "../api";
 import TokenActions from "./TokenActions";
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -28,6 +28,10 @@ const EVENT_STYLE = {
   STOP_OUT: { symbol: X_SYMBOL, color: "#FF5147", size: 11, verb: "stopped out" },
   FINALIZE: { symbol: "circle", color: "#6F8E38", size: 6, verb: "position closed" },
   EXPIRE: { symbol: "circle", color: "#6F8E38", size: 6, verb: "watch expired (never dipped)" },
+  MANUAL_SELL: { symbol: "diamond", color: "#E8C547", size: 10, verb: "manual sell" },
+  MANUAL_BUY: { symbol: "triangle", color: "#E8C547", size: 11, verb: "manual buy" },
+  MANUAL_SELL_SUBMITTED: { symbol: "circle", color: "#E8C547", size: 6, verb: "manual sell sent" },
+  MANUAL_BUY_SUBMITTED: { symbol: "circle", color: "#E8C547", size: 6, verb: "manual buy sent" },
 };
 
 const STATE_TONE = {
@@ -521,6 +525,18 @@ export default function TokenTerminal({ mint, onClose }) {
         <div className="flex items-center gap-2.5 min-w-0">
           <span className="text-[24px] font-bold tracking-tight text-ink leading-none">
             {pos?.ticker || mint.slice(0, 6)}
+          </span>
+          {/* the full-screen modal covers the page's LIVE/PAPER toggle — the buy/sell buttons
+              below need their own unambiguous money-context cue (post-incident hardening) */}
+          <span
+            className={`mepola-badge px-1.5 text-[11px] font-bold tracking-[0.12em] ${
+              currentBook() === "live" ? "text-loss" : "text-muted"
+            }`}
+            title={currentBook() === "live"
+              ? "actions here move REAL money"
+              : "practice book — simulated money"}
+          >
+            {currentBook() === "live" ? "LIVE · REAL $" : "PAPER · PRACTICE"}
           </span>
           {pos?.state && (
             <span

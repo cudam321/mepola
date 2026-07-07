@@ -53,7 +53,7 @@ def test_post_kill_switch_persists(client):
 def test_post_stake_ok(client):
     r = client.post("/api/control", json={"key": "ctl_stake_usd", "value": 5})
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "key": "ctl_stake_usd", "value": 5.0}
+    assert r.json() == {"ok": True, "key": "ctl_stake_usd", "value": 5.0, "book": "live"}
     assert client.get("/api/control").json()["editable"]["ctl_stake_usd"]["value"] == 5.0
 
 
@@ -211,3 +211,28 @@ def test_stream_endpoint_shape(client, monkeypatch):
     buy = rows[1]
     assert buy["value_usd"] == 3.0 and buy["pnl_usd"] is None
     assert client.get("/api/stream?scope=bogus").status_code == 422
+
+
+# -- H4 (audit 2026-07-07): controls are book-scoped ---------------------------------- #
+def test_paper_tab_control_never_touches_the_live_kill_switch(client, tmp_path, monkeypatch):
+    paper = tmp_path / "paper_state.db"
+    LiveState(paper).close()
+    monkeypatch.setenv("MEMEBOT_PAPER_DB", str(paper))
+
+    r = client.post("/api/control", json={"key": "kill_switch", "value": "on", "book": "paper"})
+    assert r.status_code == 200 and r.json()["book"] == "paper"
+    # the LIVE book's kill switch is untouched
+    assert client.get("/api/control").json()["editable"]["kill_switch"]["value"] == "off"
+    # (Settings.load() inside get_control re-exports the developer's .env — including
+    # DASHBOARD_PASSWORD — which arms auth mid-test; see conftest docstring)
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    # the PAPER book shows its own
+    r = client.get("/api/control?book=paper")
+    assert r.status_code == 200
+    assert r.json()["editable"]["kill_switch"]["value"] == "on"
+
+
+def test_control_bad_book_rejected(client):
+    assert client.get("/api/control?book=lol").status_code == 422
+    r = client.post("/api/control", json={"key": "kill_switch", "value": "on", "book": "lol"})
+    assert r.status_code == 422

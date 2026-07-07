@@ -20,7 +20,14 @@ What exists (all under `src/memebot/live/` + `dashboard/`, isolated from the res
 - **Engine**: `strategy.py` (config-#1 machine, fp-exact to `stage38 sim`), `engine.py`, `run.py`
   (async orchestrator), `executor.py` (Paper default; Live gated+inert), `state.py` (SQLite, single
   writer), `risk.py` ($3 fixed, `STAKE_HARD_CAP_USD=10`), `pricefeed.py`, `listener.py` (telethon),
-  `monitor.py` (self-awareness).
+  `monitor.py` (self-awareness: feed/listener/reconciler watchdogs + per-trade path deviation vs
+  the C1 sim twin), `notify.py` (CRIT/WARN → a Telegram alert bot that actually rings the phone;
+  set `TELEGRAM_ALERT_BOT_TOKEN`).
+- **Execution safety** (hardened after a real incident — see `docs/audits/`): confirm-then-commit
+  on on-chain truth, ambiguous balance reads fail CLOSED (a lagged zero must never book a $0 sell),
+  per-leg drift verification, a wallet==book equity invariant with step-change alarms, order-status
+  compare-and-swap across the two processes, and OHLC sanity on every candle path. Every audit
+  finding is regression-tested.
 - **Shadow lab** (`shadow.py`): 18 challengers C1–C18 + user-added **custom X\*** strategies race
   forward on the SAME live ticks; per-leg flush to `shadow_trades`; `research.py` re-measures the full
   grid on request. Promotion is human-only (allowlist C1–C10). ALL 18 are pinned to their research

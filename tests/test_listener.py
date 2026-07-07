@@ -61,16 +61,17 @@ def test_process_event_forwards_tradable(monkeypatch):
 
 
 class FakeClient:
-    """Duck-typed telethon client: get_messages returns NEWEST-first, honoring min_id/limit."""
+    """Duck-typed telethon client: get_messages honors min_id/limit/reverse (reverse=True ->
+    oldest-first from min_id, like telethon)."""
 
     def __init__(self, msgs):
         self._msgs = msgs
 
-    async def get_messages(self, channel, *, limit=None, min_id=None):
+    async def get_messages(self, channel, *, limit=None, min_id=None, reverse=False):
         out = self._msgs
         if min_id is not None:
             out = [m for m in out if m.id > min_id]
-        out = sorted(out, key=lambda m: m.id, reverse=True)
+        out = sorted(out, key=lambda m: m.id, reverse=not reverse)
         return out[:limit] if limit else out
 
 
@@ -102,3 +103,42 @@ def test_catch_up_replays_missed_oldest_first(monkeypatch):
 def test_catch_up_noop_without_state():
     # no state -> nothing to persist, no crash
     asyncio.run(listener._catch_up(FakeClient([]), "@c", lambda s: None, None))
+
+
+def test_catch_up_paginates_past_the_page_limit(monkeypatch):
+    """M14: >1 page of missed messages must ALL replay (oldest were silently dropped before)."""
+    st = FakeState()
+    st.kv["last_listener_msg_id"] = "0"
+    seen = []
+    monkeypatch.setattr(listener, "signals_from_messages",
+                        lambda msgs, ch: [SimpleNamespace(is_tradable=True, _id=msgs[0]["id"])])
+
+    async def on_call(sig):
+        seen.append(sig._id)
+
+    client = FakeClient([_ev(i, f"m{i}") for i in range(1, 451)])   # 450 missed > 2 pages
+    st.kv["last_listener_msg_id"] = "0"
+    # first-connect pin would skip; force the replay path
+    asyncio.run(listener._catch_up(client, "@c", on_call, st))
+    # last_id==0 -> first-connect pin path; set a real high-water and rerun
+    st2 = FakeState(); st2.kv["last_listener_msg_id"] = "50"
+    seen.clear()
+    asyncio.run(listener._catch_up(client, "@c", on_call, st2))
+    assert seen == list(range(51, 451))                  # every missed message, oldest-first
+    assert st2.kv["last_listener_msg_id"] == "450"
+
+
+def test_failed_ingest_does_not_consume_the_message(monkeypatch):
+    """M14: high-water advances only after on_call succeeds — a crash mid-ingest retries."""
+    st = FakeState()
+    monkeypatch.setattr(listener, "signals_from_messages",
+                        lambda msgs, ch: [SimpleNamespace(is_tradable=True)])
+
+    async def boom(sig):
+        raise RuntimeError("ingest died")
+
+    try:
+        asyncio.run(listener._process_event(_ev(7, "buy X"), "@c", boom, st))
+    except RuntimeError:
+        pass
+    assert st.kv.get("last_listener_msg_id") is None      # NOT consumed

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import re
@@ -41,6 +42,11 @@ from memebot.live.risk import STAKE_HARD_CAP_USD
 
 DB_PATH = os.environ.get("MEMEBOT_DB", str(data.DEFAULT_DB))
 FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+
+# SECURITY: httpx logs every request URL at INFO — credential-bearing URLs (Helius api-key in
+# the RPC URL) must never hit the process logs. Same guard as run.py main().
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 app = FastAPI(title="memebot tail-rider dashboard")
 app.add_middleware(
@@ -78,7 +84,7 @@ def _book_err(book: str):
 
 
 def _snapshot(db: Optional[str] = None) -> dict:
-    st = data.open_state(db or DB_PATH)
+    st = data.open_state(db if db is not None else DB_PATH)
     try:
         return data.snapshot(st)
     finally:
@@ -101,7 +107,10 @@ def get_snapshot(book: str = "live") -> JSONResponse:
     err = _book_err(book)
     if err is not None:
         return err
-    snap = _snapshot(_db_for(book))
+    db = _db_for(book)
+    if db is None:      # re-audit TOCTOU: paper DB vanished between the check and the resolve —
+        return _err("book unavailable", 404)   # never silently serve LIVE data labelled paper
+    snap = _snapshot(db)
     snap["meta"]["book"] = book
     return JSONResponse(snap)
 
@@ -260,9 +269,14 @@ def _ctl_defaults() -> dict[str, float]:
 
 
 @app.get("/api/control")
-def get_control() -> JSONResponse:
+def get_control(book: str = "live") -> JSONResponse:
+    # H4 (audit 2026-07-07): controls are BOOK-SCOPED like every other endpoint — a practice
+    # tab reading/writing the LIVE kill-switch or stake was the one unscoped surface left.
+    err = _book_err(book)
+    if err is not None:
+        return err
     defaults = _ctl_defaults()
-    st = data.open_state(DB_PATH)
+    st = data.open_state(_db_for(book))
     try:
         kill = st.get_system("kill_switch", "off")
         mode = st.get_system("mode", "paper")
@@ -279,6 +293,7 @@ def get_control() -> JSONResponse:
         "editable": editable,
         "locked": _LOCKED_STRATEGY,
         "mode": mode,
+        "book": book,
         "mode_note": "live arming is CLI-gated (MEMEBOT_LIVE_ARMED), never a UI toggle",
     })
 
@@ -286,13 +301,13 @@ def get_control() -> JSONResponse:
 _custom_lock = threading.Lock()   # serialize read-modify-write of the custom set
 
 
-def _custom_challenger_control(action: str, value) -> JSONResponse:
+def _custom_challenger_control(action: str, value, db_path: str) -> JSONResponse:
     """add_challenger / delete_challenger: mutate the custom set in system_state.
     The engine polls custom_challengers_rev and races new strategies forward-only."""
     from memebot.live.shadow import CUSTOM_KEY, CUSTOM_REV_KEY, MAX_CUSTOM, challenger_from_dict
     from memebot.live.state import LiveState
     with _custom_lock:
-        st = LiveState(DB_PATH)
+        st = LiveState(db_path)
         try:
             try:
                 existing = json.loads(st.get_system(CUSTOM_KEY) or "[]")
@@ -344,10 +359,17 @@ def _custom_challenger_control(action: str, value) -> JSONResponse:
 
 @app.post("/api/control")
 def post_control(body: dict) -> JSONResponse:
+    # H4: book-scoped writes — a practice tab must never flip the LIVE kill-switch/stake
+    book = str(body.get("book") or "live")
+    err = _book_err(book)
+    if err is not None:
+        return err
     key = body.get("key")
     value = body.get("value")
     if key in ("add_challenger", "delete_challenger"):
-        return _custom_challenger_control(key, value)
+        # the strategy lab races on LIVE ticks only (no shadow engine polls the paper DB) —
+        # challenger config always lives in the live DB regardless of the tab's book
+        return _custom_challenger_control(key, value, DB_PATH)
     if key == "kill_switch":
         if value not in ("on", "off"):
             return JSONResponse({"error": 'kill_switch must be "on" or "off"'}, status_code=422)
@@ -376,12 +398,12 @@ def post_control(body: dict) -> JSONResponse:
     else:
         return JSONResponse({"error": f"unknown or non-editable key: {key!r}"}, status_code=400)
     from memebot.live.state import LiveState  # writable open (idempotent DDL); brief, then close
-    st = LiveState(DB_PATH)
+    st = LiveState(_db_for(book))
     try:
         st.set_system(key, str(value))
     finally:
         st.close()
-    return JSONResponse({"ok": True, "key": key, "value": value})
+    return JSONResponse({"ok": True, "key": key, "value": value, "book": book})
 
 
 # --------------------------------------------------------------------------- #
@@ -422,8 +444,11 @@ def _numv(v):
 def post_manual_order(body: dict) -> JSONResponse:
     from memebot.live.state import LiveState
     # book: "live" places a REAL order (engine executes it); "paper" places a PRACTICE order the
-    # paper twin fills with simulated money — full functionality, zero risk (user request 2026-07-06)
-    book = str(body.get("book") or "live")
+    # paper twin fills with simulated money. REQUIRED (re-audit): an omitted book must never
+    # default onto real money.
+    if not body.get("book"):
+        return _err('book is required ("live" or "paper")')
+    book = str(body.get("book"))
     berr = _book_err(book)
     if berr is not None:
         return berr
@@ -480,6 +505,18 @@ def post_manual_order(body: dict) -> JSONResponse:
                 return _err("token_frac must be in (0, 1]")
             if not pos or pos["state"] not in _ACTIVE_STATES:
                 return _err("no open position to act on", 409)
+            # re-audit: a stop at/above the market fires on the very next candle as an immediate
+            # market dump (a typo'd level on a 0.0000x-priced token is one keystroke away).
+            # Never silently — force=true to confirm (mirrors the M13 release guard). The client
+            # guard alone is inert whenever the live-price poll returns null.
+            px_now = pos.get("current_price")
+            if (kind == "stop_loss" and trigger_type == "price_at_or_below"
+                    and trigger_value is not None and px_now and px_now > 0
+                    and trigger_value >= px_now and not bool(body.get("force"))):
+                return JSONResponse(
+                    {"error": f"stop {trigger_value:.8g} is at/above the current price "
+                              f"{px_now:.8g} — it would fire immediately; pass force=true to "
+                              "confirm", "would_fire_immediately": True}, status_code=409)
         expires_at = None
         if expires_h and expires_h > 0:
             expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_h)
@@ -526,7 +563,9 @@ def get_manual_orders(status: str = "open", book: str = "live") -> JSONResponse:
 
 
 @app.delete("/api/manual/order/{order_id}")
-def cancel_manual_order(order_id: int, book: str = "live") -> JSONResponse:
+def cancel_manual_order(order_id: int, book: str) -> JSONResponse:
+    # M16: `book` is REQUIRED here — order ids are per-DB autoincrements, so a caller that
+    # forgot ?book=paper would cancel the same-numbered LIVE order. Fail loudly instead.
     from memebot.live.state import LiveState
     err = _book_err(book)
     if err is not None:
@@ -536,16 +575,19 @@ def cancel_manual_order(order_id: int, book: str = "live") -> JSONResponse:
         o = st.get_order(order_id)
         if o is None:
             return _err("unknown order", 404)
-        if o["status"] != "open":
+        # H3: compare-and-swap — the engine may claim (fire) the order between our read and
+        # this write; the guard makes exactly one side win, never both.
+        if not st.claim_order(order_id, "open", "cancelled", note="cancelled by user"):
+            o = st.get_order(order_id) or o
             return _err(f"order is '{o['status']}' — only an open order can be cancelled", 409)
-        st.update_order(order_id, status="cancelled", note="cancelled by user")
         return JSONResponse({"ok": True})
     finally:
         st.close()
 
 
 @app.patch("/api/manual/order/{order_id}")
-def modify_manual_order(order_id: int, body: dict, book: str = "live") -> JSONResponse:
+def modify_manual_order(order_id: int, body: dict, book: str) -> JSONResponse:
+    # M16: `book` REQUIRED — see cancel_manual_order.
     from memebot.live.state import LiveState
     err = _book_err(book)
     if err is not None:
@@ -572,12 +614,26 @@ def modify_manual_order(order_id: int, body: dict, book: str = "live") -> JSONRe
                 hard = float(st.get_system("manual_trade_hard_cap_usd") or 0)
                 if hard > 0:
                     sv = min(sv, hard)
+                sv = min(sv, STAKE_HARD_CAP_USD)   # re-audit: modify honors the ceiling too
             if o["size_kind"] == "token_frac" and not (0 < sv <= 1):
                 return _err("token_frac must be in (0, 1]")
             fields["size_value"] = sv
+        # re-audit: modifying a stop's level gets the same would-fire-now guard as create
+        if ("trigger_value" in fields and o["kind"] == "stop_loss"
+                and o["trigger_type"] == "price_at_or_below" and not bool(body.get("force"))):
+            pos = st.get_position(o["mint"]) or {}
+            px_now = pos.get("current_price")
+            if px_now and px_now > 0 and fields["trigger_value"] >= px_now:
+                return JSONResponse(
+                    {"error": f"stop {fields['trigger_value']:.8g} is at/above the current "
+                              f"price {px_now:.8g} — it would fire immediately; pass "
+                              "force=true to confirm", "would_fire_immediately": True},
+                    status_code=409)
         if not fields:
             return _err("nothing to modify (trigger_value / size_value)")
-        st.update_order(order_id, **fields)
+        # H3: status-guarded write — a modify must not land on an order the engine just fired
+        if not st.claim_order(order_id, "open", "open", **fields):
+            return _err("order is no longer open — not modified", 409)
         return JSONResponse({"ok": True, **fields})
     finally:
         st.close()
@@ -586,7 +642,9 @@ def modify_manual_order(order_id: int, body: dict, book: str = "live") -> JSONRe
 @app.post("/api/watchlist")
 def add_watchlist(body: dict) -> JSONResponse:
     from memebot.live.state import LiveState
-    book = str(body.get("book") or "live")
+    if not body.get("book"):
+        return _err('book is required ("live" or "paper")')   # re-audit: never default to live
+    book = str(body.get("book"))
     berr = _book_err(book)
     if berr is not None:
         return berr
@@ -604,7 +662,7 @@ def add_watchlist(body: dict) -> JSONResponse:
 
 
 @app.delete("/api/watchlist/{mint}")
-def remove_watchlist(mint: str, book: str = "live") -> JSONResponse:
+def remove_watchlist(mint: str, book: str) -> JSONResponse:
     from memebot.live.state import LiveState
     err = _book_err(book)
     if err is not None:
@@ -618,7 +676,9 @@ def remove_watchlist(mint: str, book: str = "live") -> JSONResponse:
 
 
 @app.post("/api/positions/{mint}/takeover")
-def takeover_position(mint: str, book: str = "live") -> JSONResponse:
+def takeover_position(mint: str, book: str) -> JSONResponse:
+    # book REQUIRED (re-audit): the paper twin trades the SAME mints as live —
+    # a caller that forgot ?book= must 422, never take over the REAL position
     """Transfer an algo position to the human. The engine drops its TailRider on the next sampler
     reconcile (≤30s) — take-over is deliberate, not time-critical — and the human's orders drive it."""
     from memebot.live.state import LiveState
@@ -634,15 +694,30 @@ def takeover_position(mint: str, book: str = "live") -> JSONResponse:
             return _err("already under manual control", 409)
         st.update_position(mint, controller="manual")
         st.set_system("controller_rev", str(int(st.get_system("controller_rev") or "0") + 1))
+        # M11 (audit 2026-07-07): taking over an UNSECURED position strips the algo's −30% stop
+        # — the human may not realize the bag is now unprotected (and the chart still draws a
+        # stop line). Carry the protection over as a REAL resting stop order the OrderBook
+        # executes; the human can cancel/edit it like any of their orders.
+        carried = None
+        if not pos.get("secured") and pos.get("stop_price"):
+            oid = st.create_order(mint=mint, ticker=pos.get("ticker"), position_id=pos["id"],
+                                  kind="stop_loss", side="sell",
+                                  trigger_type="price_at_or_below",
+                                  trigger_value=float(pos["stop_price"]), size_kind="token_frac",
+                                  size_value=1.0, created_by="takeover",
+                                  note="carried from algo (−30% stop) — cancel/edit as you like")
+            carried = {"order_id": oid, "stop_price": float(pos["stop_price"])}
         st.record_alert(severity="INFO", kind="MANUAL_ORDER",
-                        message=f"took over {pos.get('ticker') or mint[:6]}… (algo → manual)")
-        return JSONResponse({"ok": True})
+                        message=f"took over {pos.get('ticker') or mint[:6]}… (algo → manual)"
+                                + (" — the −30% stop was carried over as a resting order"
+                                   if carried else ""))
+        return JSONResponse({"ok": True, "carried_stop": carried})
     finally:
         st.close()
 
 
 @app.post("/api/positions/{mint}/release")
-def release_position(mint: str, book: str = "live") -> JSONResponse:
+def release_position(mint: str, book: str, body: Optional[dict] = None) -> JSONResponse:
     """Hand a manual position back to the algo. The engine rehydrates a TailRider from its current
     state on the next reconcile (the algo resumes as a config-#1 position from where it stands)."""
     from memebot.live.state import LiveState
@@ -656,11 +731,38 @@ def release_position(mint: str, book: str = "live") -> JSONResponse:
             return _err("no active position to release", 404)
         if pos.get("controller") != "manual":
             return _err("position is not under manual control", 409)
+        # M13 (audit 2026-07-07): releasing an UNSECURED position that is already at/below the
+        # −30% line hands it to an algo whose first act is a full market stop-out. That may be
+        # what the user wants — but never silently: require an explicit force.
+        entry0, px0, stop0 = pos.get("entry_price"), pos.get("current_price"), pos.get("stop_price")
+        if (not pos.get("secured") and stop0 and px0 and px0 <= stop0
+                and not bool((body or {}).get("force"))):
+            return JSONResponse(
+                {"error": "releasing now would stop out immediately "
+                          f"(price {px0:.8g} ≤ stop {stop0:.8g}) — pass force=true to confirm",
+                 "would_stop_immediately": True}, status_code=409)
+        # AUDIT B5 (2026-07-07): fast-forward the rung ladder HERE, before the controller flips —
+        # if the engine is down (redeploy/crash) when the release lands, boot rehydrate restores
+        # `lvl = next_rung_mult or 3.0` and would replay every missed rung at market (the
+        # ladder-replay incident). Persisting the advanced rung makes the release safe no matter which
+        # process applies it; the orchestrator's own fast-forward stays as an idempotent second net.
+        # SECURED-only, mirroring the sim's progression (x2 while n_tp < 5, then x3).
+        entry, px = pos.get("entry_price"), pos.get("current_price")
+        if pos.get("secured") and entry and px and px > 0:
+            n_tp = pos.get("n_tp") or 0
+            lvl = pos.get("next_rung_mult") or 3.0
+            while lvl * entry <= px:
+                n_tp += 1
+                lvl = lvl * 2 if n_tp < 5 else lvl * 3
+            if lvl != pos.get("next_rung_mult"):
+                st.update_position(mint, n_tp=n_tp, next_rung_mult=lvl, next_rung_price=lvl * entry)
         st.update_position(mint, controller="algo")
         st.set_system("controller_rev", str(int(st.get_system("controller_rev") or "0") + 1))
-        # its resting manual orders no longer apply once the algo drives it
+        # its resting manual orders no longer apply once the algo drives it. H3 discipline:
+        # cancel via CAS from 'open' only — an in-flight ('submitted') order resolves through
+        # the engine's own result path, never by overwriting its durable marker mid-swap.
         for o in st.open_orders(mint):
-            st.update_order(o["id"], status="cancelled", note="released to algo")
+            st.claim_order(o["id"], "open", "cancelled", note="released to algo")
         st.record_alert(severity="INFO", kind="MANUAL_ORDER",
                         message=f"released {pos.get('ticker') or mint[:6]}… (manual → algo)")
         return JSONResponse({"ok": True})
@@ -674,7 +776,9 @@ def post_signal(body: dict) -> JSONResponse:
     for the anchor + immediate feedback; the engine loop picks up the pending row and creates the
     WATCHING position, exactly like a channel signal."""
     from memebot.live.state import LiveState
-    book = str(body.get("book") or "live")
+    if not body.get("book"):
+        return _err('book is required ("live" or "paper")')   # re-audit: never default to live
+    book = str(body.get("book"))
     berr = _book_err(book)
     if berr is not None:
         return berr
@@ -908,7 +1012,7 @@ def get_candles(mint: str, range: str = "call", interval: str = "auto",
     except Exception:
         candles = []          # F35: datapi down/rate-limited -> 200 with empty candles + the
         # level overlay (below), mirroring get_live, instead of an unhandled 500.
-    # LESSON (RESEARCH.md): datapi does NOT honor time bounds — clamp at the call
+    # LESSON (tasks/lessons.md): datapi does NOT honor time bounds — clamp at the call
     # site or an unclamped fetch manufactures pre-signal history.
     candles = [c for c in candles if start <= c.ts <= end]
 

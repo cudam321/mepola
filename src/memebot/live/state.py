@@ -379,6 +379,16 @@ class LiveState:
         )
         self.conn.commit()
 
+    def unmark_failed_manual_seen(self, mint: str) -> None:
+        """M7 (audit 2026-07-07): a direct buy that never confirmed must not blacklist the mint
+        from every future entry path forever (F27 regression). Only rows a MANUAL flow created
+        (no source_channel) with a 'positioned' outcome are cleared — channel-signal dedupe (the
+        first-call-per-mint trading unit) is untouched."""
+        self.conn.execute(
+            "DELETE FROM seen_mints WHERE mint=? AND outcome='positioned' "
+            "AND source_channel IS NULL", (mint,))
+        self.conn.commit()
+
     # -- signals feed ------------------------------------------------------ #
     def record_signal(self, *, ts: datetime, source_channel, message_id, ticker, mint, side,
                       parse_confidence=0.0, is_first_call=False, accepted=False,
@@ -582,6 +592,24 @@ class LiveState:
         cols = ", ".join(f"{k}=?" for k in fields)
         self.conn.execute(f"UPDATE orders SET {cols} WHERE id=?", (*fields.values(), order_id))
         self.conn.commit()
+
+    def claim_order(self, order_id: int, from_status: str, to_status: str, **fields) -> bool:
+        """Compare-and-swap an order's status (H3, audit 2026-07-07). The dashboard and the
+        engine are separate PROCESSES sharing this table: without the status guard, the engine
+        firing an order can overwrite the user's just-written 'cancelled' (a cancelled resting
+        stop that still sells), and a failed in-flight order can resurrect a cancel by resetting
+        to 'open'. Returns False when the row is no longer in `from_status` — the caller must
+        treat the claim as lost and NOT act."""
+        bad = set(fields) - self._columns("orders")
+        if bad:
+            raise ValueError(f"claim_order: unknown column(s) {sorted(bad)}")
+        fields["updated_at"] = to_iso(utcnow())
+        sets = ", ".join(f"{k}=?" for k in ("status", *fields))
+        cur = self.conn.execute(
+            f"UPDATE orders SET {sets} WHERE id=? AND status=?",
+            (to_status, *fields.values(), order_id, from_status))
+        self.conn.commit()
+        return cur.rowcount == 1
 
     def get_order(self, order_id: int) -> Optional[dict]:
         row = self.conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()

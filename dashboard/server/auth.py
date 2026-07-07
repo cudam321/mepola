@@ -18,6 +18,7 @@ websocket upgrades are closed with code 4401 without being accepted.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hmac
 import os
@@ -68,6 +69,10 @@ class BasicAuthMiddleware:
             if scope.get("path") in self.exempt_paths or self._authorized(scope, password):
                 await self.app(scope, receive, send)
                 return
+            # re-audit: throttle online password guessing against a public real-money control
+            # plane — a flat 1s delay on every failed attempt caps brute force at ~86k/day
+            # without any per-IP state (single-operator tool; the delay is invisible to humans).
+            await asyncio.sleep(1.0)
             await send({
                 "type": "http.response.start",
                 "status": 401,
@@ -82,4 +87,5 @@ class BasicAuthMiddleware:
         if self._authorized(scope, password):
             await self.app(scope, receive, send)
             return
+        await asyncio.sleep(1.0)                 # same brute-force throttle as http
         await send({"type": "websocket.close", "code": 4401})

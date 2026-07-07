@@ -27,7 +27,7 @@ def _mk_candle(ts: datetime, px: float = 1.0) -> Candle:
 
 
 class FakeCharts:
-    """Deliberately IGNORES [start, end] — like the real datapi (see RESEARCH.md)."""
+    """Deliberately IGNORES [start, end] — like the real datapi (see tasks/lessons.md)."""
 
     def __init__(self, candles: list[Candle]) -> None:
         self.candles = candles

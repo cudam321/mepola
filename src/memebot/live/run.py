@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -182,6 +182,12 @@ class Orchestrator:
     def __init__(self, db_path=DEFAULT_DB, *, settings: Optional[Settings] = None):
         self.state = LiveState(db_path)
         self._alert_times: dict[str, float] = {}     # per-kind alert throttle — FIRST (init-time alerts)
+        # re-audit: pin the alert-push high-water BEFORE any boot repair/config alert is
+        # recorded — the pusher's own first-boot init pins to MAX(id), which would consume
+        # this boot's CRITs unheard on a brand-new DB
+        if self.state.get_system("alerts_pushed_id") is None:
+            m = self.state.query("SELECT COALESCE(MAX(id),0) AS m FROM alerts")[0]["m"]
+            self.state.set_system("alerts_pushed_id", str(m))
         n_orphan = repair_orphan_closed_trades(self.state)
         if n_orphan:
             log.warning("closed_trades repair: reconstructed %d orphan closed trade(s)", n_orphan)
@@ -369,6 +375,7 @@ class Orchestrator:
         # (the FIRST 1m candle OPEN at/after the signal — spot diverged up to 24%).
         self.charts = JupiterChartsClient(min_interval=0.4)
         self._candle_hw: dict[str, datetime] = {}    # mint -> ts of the last TRUE candle fed
+        self._candle_last_close: dict[str, float] = {}   # mint -> last true close (outlier guard)
         self._anchored: set[str] = set()             # mints whose anchor-fidelity pass is done
         self._backfill_targets: dict[str, datetime] = {}
         # re-track any positions (champion or shadow) that were live at shutdown, and
@@ -452,10 +459,16 @@ class Orchestrator:
     def _on_dead(self, mint: str, last_price: float) -> None:
         log.info("dead token %s -> finalize at %.8g", mint, last_price)
         now = utcnow()
-        if mint in self.engine.manual_pids:          # M4: dead manual positions close too (else they
-            self.engine.finalize_manual(mint, last_price, now)   # linger, holding cap + inflating equity
-        else:
-            self.engine.finalize_token(mint, last_price, now)
+        try:
+            if mint in self.engine.manual_pids:      # M4: dead manual positions close too (else they
+                self.engine.finalize_manual(mint, last_price, now)   # linger, holding cap + equity
+            else:
+                self.engine.finalize_token(mint, last_price, now)
+        except Exception:                            # re-audit: one mint's finalize must never
+            log.exception("live dead-finalize failed for %s", mint)   # take the feed down
+            self._alert("WARN", "DEAD_FINALIZE_FAILED",
+                        f"{mint[:6]}… dead-token finalize raised — will retry on the next "
+                        "dead-check; investigate if it repeats")
         if self.paper_eng is not None:               # PAPER TWIN: its book closes the dead token too
             try:
                 if mint in self.paper_eng.manual_pids:   # a practice take-over closes like M4
@@ -490,15 +503,26 @@ class Orchestrator:
                 await self._refresh_wallet()     # keep the dashboard's wallet line fresh (~3min)
                 # (a) open positions: real balance vs expected remaining bag
                 rows = self.state.query(
-                    "SELECT mint,tokens_qty,remaining_frac FROM positions "
-                    "WHERE state IN ('ENTERED','SECURED','RIDING')")
+                    "SELECT mint,tokens_qty,remaining_frac,current_price,stake_usd,"
+                    "current_multiple FROM positions WHERE state IN ('ENTERED','SECURED','RIDING')")
+                bags_usd, bags_complete = 0.0, True
                 for r in rows:
                     mint = r["mint"]
                     if mint in self.engine._pending or not r["tokens_qty"]:
+                        bags_complete = False
                         continue
-                    real = await asyncio.to_thread(self._held_tokens, mint)
-                    if real is None:
+                    rx = await asyncio.to_thread(self._held_tokens_ex, mint)
+                    if rx is None:
+                        bags_complete = False
                         continue
+                    real, n_accounts = rx
+                    if real <= 0 and n_accounts == 0:
+                        # B6: an invisible-account zero is ambiguous (unindexed fresh ATA) — folding
+                        # a phantom 0 into the equity sum / drift WARN would false-alarm
+                        bags_complete = False
+                        continue
+                    if r["current_price"]:
+                        bags_usd += real * r["current_price"]
                     expected = (r["tokens_qty"] or 0.0) * (r["remaining_frac"]
                                                            if r["remaining_frac"] is not None else 1.0)
                     tol = max(expected * 0.05, 1e-6)
@@ -508,19 +532,90 @@ class Orchestrator:
                 # (b) orphan backstop: a balance held under a NON-open row = untracked money. Skip
                 # dead-writeoff rows (audit re-verify #7): their residual dust is KNOWN + unsellable, so
                 # CRIT-ing them every 180s would spam and mask a genuine orphan on another mint.
+                # re-audit: BOUNDED — one RPC read per row every 180s over every position ever
+                # created would grow to thousands of reads/pass within months (false RECON_STALE,
+                # RPC quota burn). Only rows that ever actually HELD tokens (an ENTER/MANUAL_BUY
+                # event exists) and closed recently can hold an orphan balance worth scanning;
+                # a WATCHING row that never bought cannot.
                 orphans = self.state.query(
-                    "SELECT mint FROM positions WHERE state IN ('WATCHING','EXPIRED','EXITED','STOPPED') "
-                    "AND (close_reason IS NULL OR close_reason != 'dead_writeoff')")
+                    "SELECT p.mint, p.current_price FROM positions p "
+                    "WHERE p.state IN ('WATCHING','EXPIRED','EXITED','STOPPED') "
+                    "AND (p.close_reason IS NULL OR p.close_reason != 'dead_writeoff') "
+                    "AND (p.closed_at IS NULL OR p.closed_at >= datetime('now', '-14 days')) "
+                    "AND EXISTS (SELECT 1 FROM position_events e WHERE e.position_id = p.id "
+                    "            AND e.event_type IN ('ENTER','MANUAL_BUY',"
+                    "                                 'ENTER_SUBMITTED','MANUAL_BUY_SUBMITTED')) "
+                    "LIMIT 200")
                 for r in orphans:
                     mint = r["mint"]
                     if mint in self.engine._pending:
                         continue
                     real = await asyncio.to_thread(self._held_tokens, mint)
                     if real and real > 1e-6:
+                        # DUST floor (2026-07-07): exit slippage routinely strands a
+                        # sub-1% token remainder after a clean stop — paging CRIT forever over
+                        # $0.03 is how the one alarm that matters gets tuned out. A residue is
+                        # only an ORPHAN when it is worth real money (or can't be valued).
+                        px = r["current_price"]
+                        val = real * px if (px and px > 0) else None
+                        if val is not None and val < 0.50:
+                            log.info("orphan dust %s: %.6g tokens ≈ $%.4f — below alert floor",
+                                     mint, real, val)
+                            continue
                         # per-mint alert kind so one mint's orphan never throttles another's (audit #7)
                         self._alert("CRIT", f"ORPHAN_BALANCE_{mint[:8]}",
-                                    f"{mint[:6]}… holds {real:.6g} tokens under a non-open position "
-                                    "— untracked on-chain balance; investigate")
+                                    f"{mint[:6]}… holds {real:.6g} tokens"
+                                    + (f" (≈${val:.2f})" if val is not None else "")
+                                    + " under a non-open position — untracked on-chain balance; "
+                                      "investigate")
+                # (c) the ONE-NUMBER invariant: wallet equity == book equity (±fees/marks).
+                # Every bug so far had the same symptom — wallet and book disagreeing — and this
+                # catches ANY future variant in a single figure, including operator sells from the
+                # burner that were never booked. Skipped when any bag read failed (a partial sum
+                # would false-alarm). SOL side includes banked proceeds; bags valued at the book's
+                # own mark so only QUANTITY/booking drift trips it, not price noise.
+                # H6 (audit 2026-07-07): the ABSOLUTE gap between wallet and book is NOT a clean
+                # alarm — the wallet is SOL-denominated while the book is USD, so SOL beta (or a
+                # deposit) opens a standing gap that would CRIT every pass until the operator tunes
+                # out the one alarm that matters. Alert instead on the STEP CHANGE in the gap since
+                # the last pass (3 min apart — SOL barely moves, but a missed $84 sell is an instant
+                # step), with a wide absolute band as backstop. The standing gap stays visible on
+                # the dashboard via wallet/book_equity_usd.
+                w = await asyncio.to_thread(self._wallet_read)
+                # M12: the rows snapshot above is minutes stale by now (bag reads are network).
+                # A position that CLOSED in between would be double-counted (stale open_mark +
+                # fresh realized) → false CRIT exactly when the big winner closes. Re-check that
+                # the open set is unchanged; else skip the invariant this pass.
+                open_now = {r2["mint"] for r2 in self.state.query(
+                    "SELECT mint FROM positions WHERE state IN ('ENTERED','SECURED','RIDING')")}
+                if w is not None and bags_complete and open_now == {r["mint"] for r in rows}:
+                    _, sol_usd_val = w
+                    wallet_eq = sol_usd_val + bags_usd
+                    start = float(self.state.get_system("bankroll_start_usd", "0") or 0)
+                    realized = self.state.query(
+                        "SELECT COALESCE(SUM(pnl_usd),0) AS s FROM closed_trades")[0]["s"] or 0.0
+                    open_mark = sum((r["stake_usd"] or 0.0) * ((r["current_multiple"] or 1.0) - 1.0)
+                                    for r in rows)
+                    fees = float(self.state.get_system("cum_onchain_fees_usd") or 0.0)  # M2
+                    book_eq = start + realized + open_mark - fees
+                    self.state.set_system("wallet_equity_usd", f"{wallet_eq:.2f}")
+                    self.state.set_system("book_equity_usd", f"{book_eq:.2f}")
+                    drift = wallet_eq - book_eq
+                    prev = self.state.get_system("equity_drift_usd")
+                    self.state.set_system("equity_drift_usd", f"{drift:.2f}")
+                    msg = (f"wallet ${wallet_eq:.2f} vs book ${book_eq:.2f} "
+                           f"({'+' if drift >= 0 else '−'}${abs(drift):.2f}) — reconcile before trusting the book")
+                    if prev is not None:
+                        step = abs(drift - float(prev))
+                        if step > max(20.0, 0.10 * max(book_eq, 1.0)):
+                            self._alert("CRIT", "WALLET_BOOK_DRIFT",
+                                        f"equity gap JUMPED ${step:.2f} in one pass — {msg}")
+                        elif step > max(5.0, 0.03 * max(book_eq, 1.0)):
+                            self._alert("WARN", "WALLET_BOOK_DRIFT",
+                                        f"equity gap moved ${step:.2f} in one pass — {msg}")
+                    # backstop: a gap this wide is worth a page even if it grew slowly
+                    if abs(drift) > max(30.0, 0.25 * max(book_eq, 1.0)):
+                        self._alert("WARN", "WALLET_BOOK_GAP_WIDE", msg)
             except Exception:
                 log.exception("onchain reconcile pass failed")
 
@@ -539,21 +634,63 @@ class Orchestrator:
                 "WHERE state IN ('WATCHING','ENTERED','SECURED','RIDING')")
             for r in rows:
                 pid, mint = r["id"], r["mint"]
-                ev = self.state.query("SELECT event_type,price,proceeds_usd FROM position_events "
-                                      "WHERE position_id=? ORDER BY id DESC LIMIT 1", (pid,))
-                if not ev or not str(ev[0]["event_type"]).endswith("_SUBMITTED"):
+                ev = self.state.query(
+                    "SELECT event_type,price,proceeds_usd,remaining_frac FROM position_events "
+                    "WHERE position_id=? ORDER BY id DESC LIMIT 1", (pid,))
+                if not ev:
                     continue
-                kind = str(ev[0]["event_type"])[: -len("_SUBMITTED")]
-                # audit #29: bound each on-chain read so a slow (not-down) RPC can't stall the whole
-                # boot (reconcile runs BEFORE the feed starts). A timeout defers this mint's reconcile,
-                # identical to the 'real is None' path — the next intent path / retry re-resolves it.
-                try:
-                    real = await asyncio.wait_for(
-                        asyncio.to_thread(self._held_tokens, mint), timeout=5.0)
-                except asyncio.TimeoutError:
-                    real = None
-                if real is None:
+                etype = str(ev[0]["event_type"])
+                if not etype.endswith("_SUBMITTED"):
+                    # M6 (audit 2026-07-07): a crash BETWEEN the committed sell event and the
+                    # position-row update leaves the row overstating the bag — a later retry or
+                    # dead-finalize would double-book the leg. The event is the truth (it carries
+                    # the post-leg remaining_frac); fold the row forward to it.
+                    ev_rem = ev[0]["remaining_frac"]
+                    pos_row = self.state.get_position(mint) or {}
+                    pos_rem = (pos_row.get("remaining_frac")
+                               if pos_row.get("remaining_frac") is not None else 1.0)
+                    if (etype in ("TP", "RIDE_SELL", "STOP_OUT", "FINALIZE", "MANUAL_SELL")
+                            and ev_rem is not None and ev_rem < pos_rem - 1e-9):
+                        if ev_rem <= 1e-9:
+                            self._close_position_from_events(pid, mint, pos_row,
+                                                             reason="crash_gap_reconciled")
+                        elif etype in ("TP", "RIDE_SELL"):
+                            # re-audit #3: remaining_frac alone is NOT enough — a TP leg also
+                            # SECURED the position (stop removed) and advanced the rung ladder.
+                            # Folding only the bag would resurrect the −30% stop on a secured
+                            # position (a routine retrace then dumps the tail the whole strategy
+                            # exists for) and re-fire a duplicate TP1 at 3x. Reconstruct the
+                            # ladder by replaying the sim's progression over the booked legs.
+                            n_legs = self.state.query(
+                                "SELECT COUNT(*) AS n FROM position_events WHERE position_id=? "
+                                "AND event_type IN ('TP','RIDE_SELL')", (pid,))[0]["n"] or 0
+                            lvl, n_tp = self.engine.cfg.tp1_mult, 0
+                            for _ in range(int(n_legs)):
+                                n_tp += 1
+                                lvl = lvl * 2 if n_tp < self.engine.cfg.ride_step_x2 else lvl * 3
+                            entry = pos_row.get("entry_price") or 0.0
+                            self.state.update_position(
+                                mint, remaining_frac=ev_rem, secured=1, n_tp=n_tp,
+                                next_rung_mult=lvl,
+                                next_rung_price=(lvl * entry if entry else None),
+                                stop_price=None)
+                            self.engine._rollback(mint)
+                        else:
+                            self.state.update_position(mint, remaining_frac=ev_rem)
+                            self.engine._rollback(mint)
+                        self._alert("WARN", "CRASH_GAP_RECONCILED",
+                                    f"{mint[:6]}… position row lagged its own booked {etype} "
+                                    f"(row rem {pos_rem:.4f} vs event {ev_rem:.4f}) — repaired")
                     continue
+                kind = etype[: -len("_SUBMITTED")]
+                # audit #29: each on-chain read is bounded (inside _read_bag_boot) so a slow RPC
+                # can't stall the whole boot; a timeout defers this mint's reconcile. B6: the read
+                # is double-checked — a zero with no visible token account comes back `ambiguous`
+                # and must never drive a book-mutating decision below.
+                r_bag = await self._read_bag_boot(mint)
+                if r_bag is None:
+                    continue
+                real, ambiguous = r_bag
                 if kind == "ENTER" and real > 1e-9:
                     entry = ev[0]["price"] or r["signal_price"]
                     stake = self.risk.size_for(self.engine._realized_equity())
@@ -592,38 +729,18 @@ class Orchestrator:
                     # bag to the REAL balance so a phantom (already-sold) position can't linger open
                     # and understate P&L. The lost fill's exact proceeds are unrecoverable — book from
                     # the KNOWN legs and alert the operator to verify on-chain.
+                    if ambiguous:       # B6: an invisible-account zero must not close a real bag
+                        self._alert("WARN", "BOOT_RECON_AMBIG",
+                                    f"{mint[:6]}… MANUAL_SELL intent unresolved: zero-balance read "
+                                    "with no visible token account (RPC lag?) — deferred")
+                        continue
                     pos = self.state.get_position(mint)
                     tq = (pos or {}).get("tokens_qty") or 0.0
                     rem = pos.get("remaining_frac") if (pos and pos.get("remaining_frac") is not None) else 1.0
                     if pos and tq and real < tq * rem * 0.98:          # bag shrank -> the sell landed
                         if real <= max(tq * 1e-6, 1e-9):              # fully sold -> close it out
-                            entry = pos.get("entry_price") or 0.0
-                            stake = pos.get("stake_usd") or 0.0
-                            prows = self.state.query(
-                                "SELECT COALESCE(SUM(proceeds_usd),0) AS p FROM position_events "
-                                "WHERE position_id=? AND event_type IN "
-                                "('TP','RIDE_SELL','STOP_OUT','FINALIZE','MANUAL_SELL')", (pid,))
-                            proceeds = float(prows[0]["p"] or 0.0)
-                            rmult = (proceeds / stake) if stake else 0.0
-                            now = utcnow()
-                            self.state.update_position(
-                                mint, state="EXITED", remaining_frac=0.0, realized_multiple=rmult,
-                                current_multiple=rmult, realized_pnl_usd=proceeds - stake,
-                                closed_at=now.isoformat(), close_reason="manual_close_reconciled")
-                            self.state.record_close(
-                                position_id=pid, mint=mint, ticker=pos.get("ticker"),
-                                entry_at=from_iso(pos.get("entry_at")), entry_price=entry,
-                                stake_usd=stake, exit_at=now, close_reason="manual_close_reconciled",
-                                realized_multiple=rmult, pnl_usd=proceeds - stake, n_tp=0,
-                                was_stopped=False, was_secured=bool(pos.get("secured")))
-                            self.engine.manual_pids.pop(mint, None)
-                            # the SUBMITTED order that landed -> filled; other resting orders ->
-                            # cancelled (position closed). NOT all -> filled (Codex review).
-                            for o in self.state.open_orders(mint):
-                                self.state.update_order(
-                                    o["id"],
-                                    status="filled" if o["status"] == "submitted" else "cancelled",
-                                    note="reconciled on restart (position closed)")
+                            self._close_position_from_events(pid, mint, pos,
+                                                             reason="manual_close_reconciled")
                             self._alert("WARN", "MANUAL_RECON",
                                         f"manual sell {mint[:6]}… landed during a crash — closed by "
                                         "reconcile; verify exact proceeds on-chain")
@@ -641,11 +758,27 @@ class Orchestrator:
                     else:
                         log.info("restart reconcile: %s MANUAL_SELL idempotent on retry", mint)
                 elif kind in ("ENTER", "MANUAL_BUY"):
-                    log.info("restart reconcile: %s %s submitted but no balance landed — retry", mint, kind)
+                    if ambiguous:
+                        # re-audit #5: match the sell side — an invisible-account zero on a buy
+                        # intent is not proof it never landed; say so instead of a silent retry
+                        # (the send-time adopt gate is the second net, but its caches are empty
+                        # right after a restart)
+                        self._alert("WARN", "BOOT_RECON_AMBIG",
+                                    f"{mint[:6]}… {kind} intent unresolved: zero-balance read "
+                                    "with no visible token account (RPC lag?) — the machine may "
+                                    "retry this buy; verify on-chain if a duplicate appears")
+                    else:
+                        log.info("restart reconcile: %s %s submitted but no balance landed — retry",
+                                 mint, kind)
                 elif kind in ("TP", "RIDE_SELL", "STOP_OUT", "FINALIZE"):
                     # audit #5: an algo sell leg landed on-chain but the loop-apply was lost (crash /
                     # confirm-timeout). Re-drive the rider through the SAME leg with the REAL proceeds
                     # (on-chain bag delta) so its P&L is not zeroed by the idempotent retry.
+                    if ambiguous:       # B6: never book a phantom full stop off an invisible account
+                        self._alert("WARN", "BOOT_RECON_AMBIG",
+                                    f"{mint[:6]}… {kind} intent unresolved: zero-balance read with "
+                                    "no visible token account (RPC lag?) — deferred")
+                        continue
                     ev_price = ev[0]["price"] or 0.0
                     if self.engine.reconcile_landed_algo_sell(mint, kind, ev_price, real):
                         self._alert("WARN", "ALGO_SELL_RECON",
@@ -659,16 +792,78 @@ class Orchestrator:
         except Exception:
             log.exception("restart intent reconcile failed")
 
+    def _close_position_from_events(self, pid: int, mint: str, pos: dict, *, reason: str) -> None:
+        """Close an open position whose bag is gone, booking realized P&L from the SUM of its
+        COMMITTED sell events — the only truth left after a crash gap (M6) or a landed manual
+        close whose loop-apply was lost. Resolves resting orders (the landed 'submitted' one →
+        filled, the rest → cancelled) and drops any rider/manual claim."""
+        entry = pos.get("entry_price") or 0.0
+        stake = pos.get("stake_usd") or 0.0
+        prows = self.state.query(
+            "SELECT COALESCE(SUM(proceeds_usd),0) AS p FROM position_events "
+            "WHERE position_id=? AND event_type IN "
+            "('TP','RIDE_SELL','STOP_OUT','FINALIZE','MANUAL_SELL')", (pid,))
+        proceeds = float(prows[0]["p"] or 0.0)
+        rmult = (proceeds / stake) if stake else 0.0
+        now = utcnow()
+        self.state.update_position(
+            mint, state="EXITED", remaining_frac=0.0, realized_multiple=rmult,
+            current_multiple=rmult, realized_pnl_usd=proceeds - stake,
+            closed_at=now.isoformat(), close_reason=reason)
+        self.state.record_close(
+            position_id=pid, mint=mint, ticker=pos.get("ticker"),
+            entry_at=from_iso(pos.get("entry_at")), entry_price=entry,
+            stake_usd=stake, exit_at=now, close_reason=reason,
+            realized_multiple=rmult, pnl_usd=proceeds - stake, n_tp=(pos.get("n_tp") or 0),
+            was_stopped=False, was_secured=bool(pos.get("secured")))
+        self.engine.manual_pids.pop(mint, None)
+        self.engine.riders.pop(mint, None)
+        self.engine.pids.pop(mint, None)
+        for o in self.state.open_orders(mint):
+            self.state.update_order(
+                o["id"],
+                status="filled" if o["status"] == "submitted" else "cancelled",
+                note=f"reconciled on restart (position closed: {reason})")
+
     def _held_tokens(self, mint: str) -> Optional[float]:
         """Real held token amount for the burner (executor's clients), or None if unavailable."""
+        r = self._held_tokens_ex(mint)
+        return None if r is None else r[0]
+
+    def _held_tokens_ex(self, mint: str) -> Optional[tuple[float, int]]:
+        """(tokens, n_accounts) for the burner, or None if unavailable. n_accounts=0 with a zero
+        total means the node sees NO token account — indistinguishable from an unindexed fresh
+        ATA, so callers making book-mutating decisions must treat it as AMBIGUOUS (B6)."""
         try:
-            swap = self.executor._ensure_clients()
-            owner = self.executor._owner()
+            with self.executor._state_lock:      # B-5: lazy client init under the executor's lock
+                swap = self.executor._ensure_clients()
+                owner = self.executor._owner()
             if owner is None:
                 return None
-            return swap.token_balance(owner, mint) / (10 ** swap.token_decimals(mint))
+            raw, n = swap.token_balance_ex(owner, mint)
+            return raw / (10 ** swap.token_decimals(mint)), n
         except Exception:
             return None
+
+    async def _read_bag_boot(self, mint: str) -> Optional[tuple[float, bool]]:
+        """Boot-decision balance read: (tokens, ambiguous). A zero with NO visible token account
+        is re-read once (2s apart, load-balanced RPC), and if still invisible it is flagged
+        ambiguous — the caller must NOT book a phantom close / stop / double-buy off it (B6:
+        the boot-time mirror of the phantom-stop $0 misread). None = RPC unavailable."""
+        for attempt in (0, 1):
+            try:
+                r = await asyncio.wait_for(asyncio.to_thread(self._held_tokens_ex, mint),
+                                           timeout=5.0)
+            except asyncio.TimeoutError:
+                return None
+            if r is None:
+                return None
+            tokens, n_accounts = r
+            if tokens > 0 or n_accounts > 0:
+                return tokens, False        # a VISIBLE account is a real answer (even zero)
+            if attempt == 0:
+                await asyncio.sleep(2.0)
+        return 0.0, True
 
     # -- live wallet truth (the balance the operator actually owns) ---------- #
     def _wallet_read(self) -> Optional[tuple[float, float]]:
@@ -806,6 +1001,7 @@ class Orchestrator:
                                 and not self.state.open_orders(mint)):
                             self.state.update_position(mint, state="EXPIRED", closed_at=now.isoformat(),
                                                        close_reason="never_entered")
+                            self.state.unmark_failed_manual_seen(mint)   # M7: don't blacklist forever
                             if not self._mint_needed(mint):
                                 self.feed.untrack(mint)
                             continue
@@ -908,12 +1104,29 @@ class Orchestrator:
                 if mint in engine._pending:
                     deferred = True
                     continue
-                engine.riders[mint] = TailRider.restore(
-                    engine.cfg, engine._pos_snapshot(pos, engine.cfg))
+                tr = TailRider.restore(engine.cfg, engine._pos_snapshot(pos, engine.cfg))
+                # ladder-replay incident (2026-07-07): a released manual position restores with
+                # lvl = next_rung_mult or tp1_mult; a NULL next rung re-armed the ladder at 3x under
+                # a ~40x price and the rider "caught up" every missed rung at market, dumping a third
+                # of the bag the operator explicitly chose to hold. A release hands the algo the
+                # position AS IT STANDS: fast-forward the rung level above the CURRENT price (no
+                # catch-up sells; n_tp advances with lvl so the x2/x3 progression stays on schedule).
+                # SECURED-only: an unsecured release still takes its TP1 catch-up (securing late at
+                # a better price is the strategy working). Boot rehydrate is deliberately NOT
+                # fast-forwarded — a rung the ALGO's own ladder crossed while offline should still
+                # sell (late, at a better price).
+                px = pos.get("current_price") or 0.0
+                if tr.entry and px > 0 and tr.secured:
+                    while tr.rem > 1e-9 and tr.lvl * tr.entry <= px:
+                        tr.n_tp += 1
+                        tr.lvl = tr.lvl * 2 if tr.n_tp < engine.cfg.ride_step_x2 else tr.lvl * 3
+                    state.update_position(mint, n_tp=tr.n_tp, next_rung_mult=tr.lvl,
+                                          next_rung_price=tr.lvl * tr.entry)
+                engine.riders[mint] = tr
                 engine.pids[mint] = pos["id"]
                 engine.manual_pids.pop(mint, None)
                 self.feed.track(mint)
-                log.info("release: %s back to the algo", mint)
+                log.info("release: %s back to the algo (next rung %.3gx)", mint, tr.lvl)
         return cached_rev if deferred else rev
 
     def _process_manual_signals(self) -> None:
@@ -993,6 +1206,28 @@ class Orchestrator:
         hw = self._candle_hw.get(mint)
         if hw is not None and candle.ts <= hw:
             return False
+        # re-audit (2026-07-07): the datapi source is KNOWN to emit garbage bars (the frontend
+        # filters "open=10.00, high<low" client-side) — server-side they would fire real stops/
+        # TPs and permanently poison a trailing stop's high-water mark. Same sanity contract as
+        # the frontend's _sane(), plus an F28-style ratio guard vs the mint's last true close.
+        if not (candle.open > 0 and candle.high > 0 and candle.low > 0 and candle.close > 0
+                and candle.high >= candle.low
+                and candle.high >= max(candle.open, candle.close)
+                and candle.low <= min(candle.open, candle.close)):
+            log.warning("dropping malformed candle for %s: o=%s h=%s l=%s c=%s",
+                        mint, candle.open, candle.high, candle.low, candle.close)
+            return False
+        last_close = self._candle_last_close.get(mint)
+        if last_close and last_close > 0:
+            hi_ratio, lo_ratio = candle.high / last_close, candle.low / last_close
+            if hi_ratio >= 20.0 or lo_ratio <= 0.02:
+                # a >20x/<0.02x jump in ONE minute is far more likely a bad bar than a real
+                # move; quarantine it (the next bar re-anchors — a REAL move persists there)
+                log.warning("quarantining outlier candle for %s: last_close=%.8g h=%.8g l=%.8g",
+                            mint, last_close, candle.high, candle.low)
+                self._candle_last_close[mint] = candle.close
+                return False
+        self._candle_last_close[mint] = candle.close
         self._candle_hw[mint] = candle.ts
         self.engine.on_candle(mint, candle)
         self.shadow.on_candle(mint, candle)     # crash-safe inside
@@ -1182,10 +1417,41 @@ class Orchestrator:
                  verdict.get("status"), verdict.get("any_config_clears_gate"),
                  verdict.get("degradation_alert"))
 
+    def _start_alert_push(self, client) -> None:
+        """Start (once) the Saved-Messages FALLBACK pusher on the listener's CONNECTED client
+        (one session, one connection — never a second login). Called on every (re)connect; a
+        still-running task is left alone. In bot mode this is a no-op — the pusher already
+        runs as a supervised boot task that needs no telethon client (H7: it must not share
+        the listener's fate). Supervised so a crash restarts it instead of killing alerting."""
+        if (os.environ.get("TELEGRAM_ALERT_BOT_TOKEN") or "").strip():
+            return
+        t = getattr(self, "_alert_push_task", None)
+        if t is not None and not t.done():
+            return
+        from memebot.live.notify import run_alert_push
+        self._alert_push_task = asyncio.create_task(
+            self._supervise("alert_push", lambda: run_alert_push(client, self.state)))
+
     async def run(self) -> None:
         from memebot.live.listener import run_listener
         log.info("orchestrator starting (mode=%s, stake=$%.2f)", self.state.get_system("mode"),
                  self.risk_cfg.stake_usd)
+        # M15 (audit 2026-07-07): booting a DRY-RUN (or unarmed) engine on a live-mode DB that
+        # holds REAL open bags is a silent catastrophe — simulated fills book against real
+        # positions while the intent reconcile and on-chain safety net are both OFF. Refuse.
+        if (self.state.get_system("mode") == "live"
+                and (self.pipeline is None or getattr(self.executor, "dry_run", True))
+                and os.environ.get("MEMEBOT_ALLOW_UNARMED_LIVE_DB") != "1"):
+            open_rows = self.state.query(
+                "SELECT COUNT(*) AS n FROM positions WHERE state IN ('ENTERED','SECURED','RIDING')")
+            if (open_rows[0]["n"] or 0) > 0:
+                self._alert("CRIT", "UNARMED_ON_LIVE_DB",
+                            "refusing to run: live-mode DB has open real positions but the "
+                            "executor is dry-run/unarmed — set MEMEBOT_LIVE_ARMED=1 + "
+                            "MEMEBOT_LIVE_SEND=1 (or MEMEBOT_ALLOW_UNARMED_LIVE_DB=1 to override)")
+                raise RuntimeError(
+                    "live-mode DB with open real positions but a dry-run/unarmed executor — "
+                    "simulated fills would corrupt the real book (M15); refusing to start")
         # Live execution runs on a worker thread; results apply back on THIS loop.
         if self.pipeline is not None:
             self.pipeline.start(asyncio.get_running_loop())
@@ -1196,12 +1462,18 @@ class Orchestrator:
         # never kills the others. The listener additionally self-reconnects with catch-up (F30).
         tasks = [
             self._supervise("listener",
-                            lambda: run_listener(CHANNEL, self._on_call, state=self.state)),
+                            lambda: run_listener(CHANNEL, self._on_call, state=self.state,
+                                                 on_client=self._start_alert_push)),
             self._supervise("feed", self.feed.run),
             self._supervise("sampler", self._sampler),
             self._supervise("reconciler", self._reconciler),
             self._supervise("controller", self._controller_loop),   # fast take-over/release (~3s)
         ]
+        # Bot-mode alert push needs no telethon client — run it from boot, supervised, so
+        # pages keep flowing even while the listener is down (H7).
+        if (os.environ.get("TELEGRAM_ALERT_BOT_TOKEN") or "").strip():
+            from memebot.live.notify import run_alert_push
+            tasks.append(self._supervise("alert_push", lambda: run_alert_push(None, self.state)))
         # LIVE real-send only: the on-chain balance drift + orphan safety net. Gated off in
         # dry-run so the supervisor doesn't log-spam restarting a task that returns immediately.
         if self.pipeline is not None and not getattr(self.executor, "dry_run", True):
@@ -1215,6 +1487,12 @@ def main() -> int:
     ap.add_argument("--log", default="INFO")
     args = ap.parse_args()
     logging.basicConfig(level=args.log, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # SECURITY: httpx logs every request URL at INFO — and two of our URLs EMBED credentials
+    # (the Helius RPC api-key, the Telegram bot token). Scrubbing our own exception strings
+    # (jupiter_swap._rpc, notify._bot_call) is worthless if the default logger prints the URL
+    # on every call. WARNING kills the per-request line; errors still surface.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     import signal
     # a Railway redeploy sends SIGTERM — make it raise KeyboardInterrupt so we drain gracefully.
     try:

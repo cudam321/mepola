@@ -27,7 +27,7 @@ entry and its `realized_multiple` is that leg's `pr/entry` — exactly the unit 
 `extend`s into its train/OOS lists. Config-level stats treat every row as one trade.
 
 v2 (CHALLENGER_SET_VERSION = 2) widens the race beyond the sim's 5-param space to every
-lever the research ever touched (RESEARCH.md). C1..C10 are UNCHANGED.
+lever the research ever touched (docs/STRATEGY_AND_FINDINGS.md). C1..C10 are UNCHANGED.
   * family="entry": deeper/shallower dips (C11/C12) and the honest 1h-delay momentum-entry
     control (C13, measured 0.80x in backtest) — enter at the FIRST candle at/after
     t0 + 1h, at THAT candle's open * 1.01, no dip wait.

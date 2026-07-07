@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { fetchSnapshot, connectWS, currentBook, setCurrentBook } from "./api";
+import { fetchSnapshot, connectWS, currentBook, setCurrentBook, withBook } from "./api";
 import PowerLawHero from "./components/PowerLawHero";
 import AccountPanel from "./components/AccountPanel";
 import StatTiles from "./components/StatTiles";
@@ -72,9 +72,10 @@ export default function App() {
 
   useEffect(() => {
     // Risk caps for utilization subs (AccountPanel) + the limits row (system health).
-    // Refetched when the controls modal closes so a saved cap shows immediately.
+    // Refetched when the controls modal closes (a saved cap shows immediately) AND on a book
+    // switch (re-audit: the other book's caps must never render under this book's numbers).
     if (showControls) return;
-    fetch("/api/control")
+    fetch(withBook("/api/control"))
       .then((r) => (r.ok ? r.json() : null))
       .then((j) => {
         const e = j?.editable || {};
@@ -86,7 +87,7 @@ export default function App() {
         });
       })
       .catch(() => {});
-  }, [showControls]);
+  }, [showControls, book]);
 
   useEffect(() => {
     // F41: both the initial HTTP fetch AND the WS push a full snapshot. Guard on the

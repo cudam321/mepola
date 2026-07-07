@@ -182,8 +182,9 @@ blockers, all fixed and regression-tested. The reports are published as-is:
 | [audit-2026-07-05-remediation](docs/audits/audit-2026-07-05-remediation.md) | remediation tracker, every blocker closed with its fix |
 | [audit-2026-07-06-final-findings](docs/audits/audit-2026-07-06-final-findings.md) | final pre-arming audit, full codebase, multiple workflows |
 | [audit-2026-07-06-final-tracker](docs/audits/audit-2026-07-06-final-tracker.md) | final verification passes and the arming decision trail |
+| [audit-2026-07-07-incident-and-hardening](docs/audits/audit-2026-07-07-incident-and-hardening.md) | first live-day incident post-mortem + the full hardening sweep and 5-agent re-audit |
 
-The 330-test suite pins the engine to the research sims, exercises the fail-closed gates
+The test suite (370+) pins the engine to the research sims, exercises the fail-closed gates
 and regression-tests every audit finding.
 
 ## Quick start (demo, no Telegram needed)
@@ -208,8 +209,11 @@ MEMEBOT_DB=/tmp/demo_state.db uv run --extra dashboard \
 1. Copy `.env.example` to `.env` and fill in your Telegram API credentials (the comments
    walk you through it). The account must have joined the channel you want to follow.
 2. Set `MEMEBOT_CHANNEL=@your_channel`.
-3. Start the paper loop: `PYTHONPATH=src python -m memebot.live.run`
-4. Pull the channel's history and run the research harness on it. Measure your channel
+3. Optional but recommended: create an alert bot (@BotFather → `/newbot`) and set
+   `TELEGRAM_ALERT_BOT_TOKEN` — CRIT/WARN alerts then actually ring your phone
+   (messages to your own Saved Messages never trigger a notification).
+4. Start the paper loop: `PYTHONPATH=src python -m memebot.live.run`
+5. Pull the channel's history and run the research harness on it. Measure your channel
    before you trust it: [RESEARCH.md](RESEARCH.md) and [`docs/RUNNING.md`](docs/RUNNING.md).
 
 Deployment on Railway or a VPS: [`docs/DEPLOY_RAILWAY.md`](docs/DEPLOY_RAILWAY.md),

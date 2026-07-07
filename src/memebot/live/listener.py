@@ -73,26 +73,34 @@ def _mark_listener_ok(state) -> None:
 async def _process_event(ev, channel: str, on_call, state) -> None:
     """Parse ONE Telegram message event -> forward tradable first-call BUYs, and advance the
     persisted high-water message id so downtime catch-up knows where to resume. Pure of
-    telethon (duck-typed `ev`) so it is unit-testable without the optional dep."""
+    telethon (duck-typed `ev`) so it is unit-testable without the optional dep.
+
+    M14 (audit 2026-07-07): the high-water advances only AFTER ingest succeeds — consuming a
+    message whose on_call raised would silently drop the call (invisible EV loss); leaving it
+    behind the watermark means the next catch-up pass retries it (first-call dedup makes any
+    overlap a no-op)."""
     text = (getattr(ev, "raw_text", "") or "").strip()
     mid = getattr(ev, "id", None)
+    if state is not None:
+        try:
+            state.set_system("last_listener_ok_ts", utcnow().isoformat())
+        except Exception:
+            pass
+    if text:
+        ev_date = getattr(ev, "date", None)
+        ts = ev_date.astimezone(timezone.utc) if ev_date else datetime.now(timezone.utc)
+        sigs = signals_from_messages(
+            [{"id": mid, "date": int(ts.timestamp()), "text": text}], channel)
+        for sig in sigs:
+            if sig.is_tradable:
+                await on_call(sig)     # a raise = message NOT consumed (retried by catch-up)
     if state is not None and mid:
         try:
             prev = int(state.get_system("last_listener_msg_id") or 0)
             if int(mid) > prev:
                 state.set_system("last_listener_msg_id", str(int(mid)))
-            state.set_system("last_listener_ok_ts", utcnow().isoformat())
         except Exception:
             pass
-    if not text:
-        return
-    ev_date = getattr(ev, "date", None)
-    ts = ev_date.astimezone(timezone.utc) if ev_date else datetime.now(timezone.utc)
-    sigs = signals_from_messages(
-        [{"id": mid, "date": int(ts.timestamp()), "text": text}], channel)
-    for sig in sigs:
-        if sig.is_tradable:
-            await on_call(sig)
 
 
 async def _catch_up(client, channel: str, on_call, state) -> None:
@@ -112,15 +120,42 @@ async def _catch_up(client, channel: str, on_call, state) -> None:
             if latest:
                 state.set_system("last_listener_msg_id", str(int(latest[0].id)))
             return
-        missed = list(await client.get_messages(channel, min_id=last_id, limit=200))
-        for ev in reversed(missed):             # get_messages returns newest-first
-            await _process_event(ev, channel, on_call, state)
-        if missed:
-            log.info("listener catch-up: processed %d missed message(s)", len(missed))
+        # M14: paginate OLDEST-FIRST until fully caught up — a single newest-first page of 200
+        # silently dropped everything older after a long outage, and the high-water then jumped
+        # past the dropped calls forever.
+        total = 0
+        while True:
+            missed = list(await client.get_messages(channel, min_id=last_id, limit=200,
+                                                    reverse=True))    # oldest-first from min_id
+            if not missed:
+                break
+            for ev in missed:
+                await _process_event(ev, channel, on_call, state)
+            total += len(missed)
+            last_id = max(int(getattr(m, "id", 0) or 0) for m in missed)
+            if len(missed) < 200:
+                break
+        if total:
+            log.info("listener catch-up: processed %d missed message(s)", total)
     except asyncio.CancelledError:
         raise
     except Exception:
         log.exception("listener catch-up failed")
+        # re-audit: a message that deterministically raises would wedge the watermark FOREVER
+        # (every later missed call silently lost) — after repeated failures at the same
+        # high-water, page the operator instead of dying softly (H7 class).
+        try:
+            key = f"catchup_fail_{last_id}"
+            n = int(state.get_system(key) or 0) + 1
+            state.set_system(key, str(n))
+            if n == 5:
+                state.record_alert(
+                    severity="CRIT", kind="CATCHUP_WEDGED",
+                    message=f"listener catch-up has failed {n}x at message id {last_id} — "
+                            "downtime replay is stuck (poison message?); calls after it are "
+                            "not being recovered")
+        except Exception:
+            pass
 
 
 async def _listener_heartbeat(client, channel: str, on_call, state, *,
@@ -147,6 +182,7 @@ async def _listener_heartbeat(client, channel: str, on_call, state, *,
 
 async def run_listener(channel: str, on_call: Callable[[Signal], Awaitable[None]],
                        *, client=None, state=None, max_backoff: float = 300.0,
+                       on_client: Optional[Callable] = None,
                        _stop_after_disconnect: bool = False) -> None:
     """Connect and forward each tradable first-call BUY to `on_call`, FOREVER. On any
     disconnect or error, reconnect with capped exponential backoff — the exception must
@@ -167,6 +203,11 @@ async def run_listener(channel: str, on_call: Callable[[Signal], Awaitable[None]
         try:
             await client.start()
             _mark_listener_ok(state)
+            if on_client is not None:
+                try:      # hand the CONNECTED client to the caller (the alert notifier reuses it)
+                    on_client(client)
+                except Exception:
+                    log.exception("on_client callback failed (listener unaffected)")
             await _catch_up(client, channel, on_call, state)
             backoff = 2.0                       # a clean connect resets the backoff
             hb = asyncio.create_task(_listener_heartbeat(client, channel, on_call, state))

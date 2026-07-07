@@ -42,7 +42,7 @@ def _mk_manual_position(db, mint=MINT, ticker="TOK"):
 
 def test_market_buy_order_created(env):
     c, db = env
-    r = c.post("/api/manual/order", json={"mint": MINT, "side": "buy", "kind": "market",
+    r = c.post("/api/manual/order", json={"book": "live", "mint": MINT, "side": "buy", "kind": "market",
                                           "size_kind": "usd", "size_value": 4.0, "ticker": "TOK"})
     assert r.status_code == 200, r.text
     oid = r.json()["id"]
@@ -55,14 +55,14 @@ def test_market_buy_order_created(env):
 def test_buy_clamped_to_hard_cap(env):
     c, db = env
     st = LiveState(db); st.set_system("manual_trade_hard_cap_usd", "10"); st.close()
-    r = c.post("/api/manual/order", json={"mint": MINT, "side": "buy", "kind": "market",
+    r = c.post("/api/manual/order", json={"book": "live", "mint": MINT, "side": "buy", "kind": "market",
                                           "size_kind": "usd", "size_value": 999.0})
     assert r.status_code == 200 and r.json()["size_value"] == 10.0
 
 
 def test_buy_invalid_mint_rejected(env):
     c, _ = env
-    r = c.post("/api/manual/order", json={"mint": "short", "side": "buy", "kind": "market",
+    r = c.post("/api/manual/order", json={"book": "live", "mint": "short", "side": "buy", "kind": "market",
                                           "size_kind": "usd", "size_value": 4.0})
     assert r.status_code == 422
 
@@ -73,7 +73,7 @@ def test_buy_blocked_when_already_holding(env):
     st.create_position(mint=MINT, ticker="TOK", signal_at=NOW, signal_price=1.0, state="ENTERED")
     st.update_position(MINT, controller="algo", entry_price=1.0)
     st.close()
-    r = c.post("/api/manual/order", json={"mint": MINT, "side": "buy", "kind": "market",
+    r = c.post("/api/manual/order", json={"book": "live", "mint": MINT, "side": "buy", "kind": "market",
                                           "size_kind": "usd", "size_value": 4.0})
     assert r.status_code == 409 and "already holding" in r.json()["error"]
 
@@ -81,7 +81,7 @@ def test_buy_blocked_when_already_holding(env):
 def test_direct_buys_disabled_when_cap_zero(env):
     c, db = env
     st = LiveState(db); st.set_system("manual_cap_usd", "0"); st.close()
-    r = c.post("/api/manual/order", json={"mint": MINT, "side": "buy", "kind": "market",
+    r = c.post("/api/manual/order", json={"book": "live", "mint": MINT, "side": "buy", "kind": "market",
                                           "size_kind": "usd", "size_value": 4.0})
     assert r.status_code == 409 and "disabled" in r.json()["error"].lower()
 
@@ -89,14 +89,14 @@ def test_direct_buys_disabled_when_cap_zero(env):
 def test_market_buy_blocked_by_kill_switch(env):
     c, db = env
     st = LiveState(db); st.set_system("kill_switch", "on"); st.close()
-    r = c.post("/api/manual/order", json={"mint": MINT, "side": "buy", "kind": "market",
+    r = c.post("/api/manual/order", json={"book": "live", "mint": MINT, "side": "buy", "kind": "market",
                                           "size_kind": "usd", "size_value": 4.0})
     assert r.status_code == 409 and "kill" in r.json()["error"].lower()
 
 
 def test_sell_requires_a_position(env):
     c, _ = env
-    r = c.post("/api/manual/order", json={"mint": MINT, "side": "sell", "kind": "market",
+    r = c.post("/api/manual/order", json={"book": "live", "mint": MINT, "side": "sell", "kind": "market",
                                           "size_kind": "token_frac", "size_value": 1.0})
     assert r.status_code == 409 and "no open position" in r.json()["error"]
 
@@ -108,7 +108,7 @@ def test_sell_order_on_algo_position_takes_it_over(env):
     st.create_position(mint=MINT, ticker="TOK", signal_at=NOW, signal_price=1.0, state="ENTERED")
     st.update_position(MINT, controller="algo", entry_price=1.0, tokens_qty=5.0, remaining_frac=1.0)
     st.close()
-    r = c.post("/api/manual/order", json={"mint": MINT, "side": "sell", "kind": "take_profit",
+    r = c.post("/api/manual/order", json={"book": "live", "mint": MINT, "side": "sell", "kind": "take_profit",
                                           "trigger_type": "mult_at_or_above", "trigger_value": 3.0,
                                           "size_kind": "token_frac", "size_value": 0.5})
     assert r.status_code == 200, r.text
@@ -121,7 +121,7 @@ def test_sell_order_on_algo_position_takes_it_over(env):
 def test_take_profit_order_on_manual_position(env):
     c, db = env
     _mk_manual_position(db)
-    r = c.post("/api/manual/order", json={"mint": MINT, "side": "sell", "kind": "take_profit",
+    r = c.post("/api/manual/order", json={"book": "live", "mint": MINT, "side": "sell", "kind": "take_profit",
                                           "trigger_type": "mult_at_or_above", "trigger_value": 3.0,
                                           "size_kind": "token_frac", "size_value": 0.5})
     assert r.status_code == 200, r.text
@@ -131,22 +131,26 @@ def test_take_profit_order_on_manual_position(env):
 def test_cancel_and_modify_order(env):
     c, db = env
     _mk_manual_position(db)
-    oid = c.post("/api/manual/order", json={"mint": MINT, "side": "sell", "kind": "stop_loss",
+    oid = c.post("/api/manual/order", json={"book": "live", "mint": MINT, "side": "sell", "kind": "stop_loss",
                                             "trigger_type": "price_at_or_below", "trigger_value": 0.7,
                                             "size_kind": "token_frac", "size_value": 1.0}).json()["id"]
-    r = c.patch(f"/api/manual/order/{oid}", json={"trigger_value": 0.8})
+    # M16: `book` is REQUIRED on the by-id endpoints (per-DB autoincrement ids — an omitted
+    # book must fail loudly, never default onto the live book)
+    assert c.patch(f"/api/manual/order/{oid}", json={"trigger_value": 0.8}).status_code == 422
+    assert c.delete(f"/api/manual/order/{oid}").status_code == 422
+    r = c.patch(f"/api/manual/order/{oid}?book=live", json={"trigger_value": 0.8})
     assert r.status_code == 200
     st = LiveState(db); assert st.get_order(oid)["trigger_value"] == 0.8; st.close()
-    assert c.delete(f"/api/manual/order/{oid}").status_code == 200
+    assert c.delete(f"/api/manual/order/{oid}?book=live").status_code == 200
     st = LiveState(db); assert st.get_order(oid)["status"] == "cancelled"; st.close()
-    assert c.delete(f"/api/manual/order/{oid}").status_code == 409   # already cancelled
+    assert c.delete(f"/api/manual/order/{oid}?book=live").status_code == 409   # already cancelled
 
 
 def test_watchlist_add_and_remove(env):
     c, db = env
-    assert c.post("/api/watchlist", json={"mint": MINT, "ticker": "TOK"}).status_code == 200
+    assert c.post("/api/watchlist", json={"book": "live", "mint": MINT, "ticker": "TOK"}).status_code == 200
     st = LiveState(db); assert st.is_watched(MINT); st.close()
-    assert c.delete(f"/api/watchlist/{MINT}").status_code == 200
+    assert c.delete(f"/api/watchlist/{MINT}?book=live").status_code == 200
     st = LiveState(db); assert not st.is_watched(MINT); st.close()
 
 
@@ -156,12 +160,12 @@ def test_non_finite_numbers_rejected(env):
     c, db = env
     _mk_manual_position(db)
     hdr = {"content-type": "application/json"}
-    body = ('{"mint": "%s", "side": "sell", "kind": "take_profit", '
+    body = ('{"book": "live", "mint": "%s", "side": "sell", "kind": "take_profit", '
             '"trigger_type": "mult_at_or_above", "trigger_value": Infinity, '
             '"size_kind": "token_frac", "size_value": 0.5}') % MINT
     r = c.post("/api/manual/order", content=body, headers=hdr)
     assert r.status_code == 422
-    body2 = ('{"mint": "%s", "side": "buy", "kind": "market", '
+    body2 = ('{"book": "live", "mint": "%s", "side": "buy", "kind": "market", '
              '"size_kind": "usd", "size_value": NaN}') % MINT
     r2 = c.post("/api/manual/order", content=body2, headers=hdr)
     assert r2.status_code == 422
@@ -170,7 +174,7 @@ def test_non_finite_numbers_rejected(env):
 def test_non_string_note_and_ticker_tolerated(env):
     # review L4: a non-string note/ticker must coerce, not 500
     c, _ = env
-    r = c.post("/api/manual/order", json={"mint": MINT, "side": "buy", "kind": "market",
+    r = c.post("/api/manual/order", json={"book": "live", "mint": MINT, "side": "buy", "kind": "market",
                                           "size_kind": "usd", "size_value": 3.0,
                                           "note": 12345, "ticker": 99})
     assert r.status_code == 200
@@ -180,7 +184,7 @@ def test_manual_cap_zero_blocks_buy(env):
     # review L2: a cap of 0 disables manual buys (not "unlimited")
     c, db = env
     st = LiveState(db); st.set_system("manual_cap_usd", "0"); st.close()
-    r = c.post("/api/manual/order", json={"mint": MINT, "side": "buy", "kind": "market",
+    r = c.post("/api/manual/order", json={"book": "live", "mint": MINT, "side": "buy", "kind": "market",
                                           "size_kind": "usd", "size_value": 3.0})
     assert r.status_code == 409 and "disabled" in r.json()["error"].lower()
 
@@ -191,14 +195,14 @@ def test_takeover_and_release(env):
     st.create_position(mint=MINT, ticker="TOK", signal_at=NOW, signal_price=1.0, state="ENTERED")
     st.update_position(MINT, controller="algo", entry_price=1.0, remaining_frac=1.0)
     st.close()
-    r = c.post(f"/api/positions/{MINT}/takeover")
+    r = c.post(f"/api/positions/{MINT}/takeover?book=live")
     assert r.status_code == 200
     st = LiveState(db)
     assert st.get_position(MINT)["controller"] == "manual"
     assert int(st.get_system("controller_rev")) >= 1
     st.close()
-    assert c.post(f"/api/positions/{MINT}/takeover").status_code == 409   # already manual
-    r = c.post(f"/api/positions/{MINT}/release")
+    assert c.post(f"/api/positions/{MINT}/takeover?book=live").status_code == 409   # already manual
+    r = c.post(f"/api/positions/{MINT}/release?book=live")
     assert r.status_code == 200
     st = LiveState(db); assert st.get_position(MINT)["controller"] == "algo"; st.close()
 
@@ -212,7 +216,7 @@ def test_inject_signal_queues_pending(env, monkeypatch):
             return {MINT: {"usdPrice": 1.5}}
 
     monkeypatch.setattr(appmod, "_price_client", FakePrice())
-    r = c.post("/api/signal", json={"mint": MINT, "ticker": "TOK"})
+    r = c.post("/api/signal", json={"book": "live", "mint": MINT, "ticker": "TOK"})
     assert r.status_code == 200 and r.json()["price"] == 1.5
     st = LiveState(db)
     pend = st.pending_manual_signals()
@@ -222,4 +226,23 @@ def test_inject_signal_queues_pending(env, monkeypatch):
 
 def test_inject_signal_invalid_mint(env):
     c, _ = env
-    assert c.post("/api/signal", json={"mint": "short"}).status_code == 422
+    assert c.post("/api/signal", json={"book": "live", "mint": "short"}).status_code == 422
+
+
+def test_release_fast_forwards_ladder_in_the_endpoint(env):
+    """AUDIT B5: the release ENDPOINT persists the fast-forwarded rung — so even if the engine
+    is down when the release lands, boot rehydrate cannot replay the ladder from 3x."""
+    c, db = env
+    st = LiveState(db)
+    st.create_position(mint=MINT, ticker="TOK", signal_at=NOW, signal_price=1.0, state="RIDING")
+    st.update_position(MINT, controller="manual", entry_price=1.0, stake_usd=3.0, tokens_qty=3.0,
+                       remaining_frac=0.5, secured=1, n_tp=1, next_rung_mult=None,
+                       current_price=40.0)
+    st.close()
+    assert c.post(f"/api/positions/{MINT}/release?book=live").status_code == 200
+    st = LiveState(db)
+    pos = st.get_position(MINT)
+    assert pos["controller"] == "algo"
+    assert pos["next_rung_mult"] == pytest.approx(72.0)   # 3→6→12→24→72, first rung ABOVE 40x
+    assert pos["n_tp"] == 5
+    st.close()

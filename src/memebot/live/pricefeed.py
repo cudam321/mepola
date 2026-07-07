@@ -102,6 +102,9 @@ class PriceFeed:
         self._active.discard(mint)
         self._absent_since.pop(mint, None)
         self._pending.pop(mint, None)
+        # re-audit: prune the price memory too — unbounded growth, and a re-tracked long-dead
+        # mint must be owned by the "never priced" guard, not dead-timed at an ancient price
+        self._last_price.pop(mint, None)
 
     def tracked(self) -> list[str]:
         """Mints currently being polled (consumed by the true-candle reconciler)."""
@@ -151,8 +154,14 @@ class PriceFeed:
                     if since is None:
                         self._absent_since[mint] = now
                     elif (now - since).total_seconds() >= self.dead_after_s:
-                        self.on_dead(mint, self._last_price.get(mint, 0.0))
+                        # re-audit: reset the timer BEFORE the callback and guard it (mirror
+                        # on_tick) — a raising finalize must not abort the batch, kill the feed
+                        # loop, and re-fire on every supervisor restart
                         self._absent_since.pop(mint, None)
+                        try:
+                            self.on_dead(mint, self._last_price.get(mint, 0.0))
+                        except Exception:
+                            log.exception("on_dead callback failed for %s", mint)
                 continue
             self._absent_since.pop(mint, None)         # present -> not absent
             # outlier guard (F28): a single stale / cross-pool tick can fire TP1 (removing the

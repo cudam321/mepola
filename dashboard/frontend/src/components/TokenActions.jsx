@@ -73,7 +73,20 @@ export default function TokenActions({ mint, pos, live, onAction }) {
     size_kind: "token_frac", size_value: f }));
   const buyNow = () => run(() => manual.placeOrder({
     mint, ticker: pos?.ticker, side: "buy", kind: "market", size_kind: "usd", size_value: Number(buyUsd) }));
-  const release = () => run(() => manual.release(mint));
+  const release = () => run(async () => {
+    try {
+      await manual.release(mint);
+    } catch (e) {
+      // M13: below the −30% line the algo's first act is a full market stop-out — confirm first
+      if (String(e.message || "").includes("would stop out immediately")
+          && window.confirm("Price is at/below the −30% stop line: the algo will market-sell "
+            + "the whole bag the moment it takes over.\n\nRelease anyway?")) {
+        await manual.release(mint, { force: true });
+        return;
+      }
+      throw e;
+    }
+  });
   const cancel = (id) => run(() => manual.cancelOrder(id));
   const submitOrder = () => {
     const map = {

@@ -225,7 +225,7 @@ def _submitted_watcher(orch, mint):
 def test_restart_adopts_landed_buy(tmp_path, monkeypatch):
     orch = _live_orchestrator(tmp_path, monkeypatch)
     _submitted_watcher(orch, "R")
-    monkeypatch.setattr(orch, "_held_tokens", lambda mint: 5.0)   # the buy actually landed on-chain
+    monkeypatch.setattr(orch, "_held_tokens_ex", lambda mint: (5.0, 1))   # the buy landed on-chain
     asyncio.run(orch._reconcile_submitted_intents())
     pos = orch.state.get_position("R")
     assert pos["state"] == "ENTERED" and pos["tokens_qty"] == 5.0   # adopted — no re-buy
@@ -237,7 +237,9 @@ def test_restart_adopts_landed_buy(tmp_path, monkeypatch):
 def test_restart_leaves_unlanded_buy_watching(tmp_path, monkeypatch):
     orch = _live_orchestrator(tmp_path, monkeypatch)
     _submitted_watcher(orch, "N")
-    monkeypatch.setattr(orch, "_held_tokens", lambda mint: 0.0)   # the buy did NOT land
+    # visible-but-empty account = an unambiguous "did not land" (B6: an invisible account
+    # would be ambiguous and simply defer)
+    monkeypatch.setattr(orch, "_held_tokens_ex", lambda mint: (0.0, 1))
     asyncio.run(orch._reconcile_submitted_intents())
     assert orch.state.get_position("N")["state"] == "WATCHING"    # stays watching -> dip window retries
     orch.state.close()
@@ -300,3 +302,61 @@ def test_workers_run_disjoint_mints_concurrently():
     elapsed = asyncio.run(drive())
     assert len(got) == 6
     assert elapsed < 3 * LAT, f"expected concurrent execution (~{LAT}s), took {elapsed:.2f}s (serial=~{6*LAT}s)"
+
+
+def test_run_prelude_executes_without_nameerrors(tmp_path, monkeypatch):
+    """Regression (audit 2026-07-07 #2): run()'s sync prelude referenced module globals the
+    ~349 unit tests never executed (they construct Orchestrator but never await run()) — a
+    missing top-level import shipped and would have crash-looped the deploy. Drive run() far
+    enough to execute every prelude line, then cancel."""
+    orch = _live_orchestrator(tmp_path, monkeypatch)
+    monkeypatch.setenv("TELEGRAM_ALERT_BOT_TOKEN", "test-token")   # exercise the bot branch too
+
+    async def fake_listener(*a, **kw):
+        await asyncio.sleep(3600)
+
+    import memebot.live.listener as listener_mod
+    monkeypatch.setattr(listener_mod, "run_listener", fake_listener)
+    monkeypatch.setattr(orch, "_reconcile_submitted_intents", _noop_coro)
+    monkeypatch.setattr(orch, "_refresh_wallet", _noop_coro)
+
+    async def drive():
+        t = asyncio.get_event_loop().create_task(orch.run())
+        await asyncio.sleep(0.2)          # past the prelude; tasks gathered and running
+        assert not t.done() or not t.exception()   # no NameError/ImportError in the prelude
+        t.cancel()
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
+    asyncio.run(drive())
+    orch.state.close()
+
+
+async def _noop_coro(*a, **kw):
+    return None
+
+
+def test_crash_gap_fold_reconstructs_the_ladder_not_just_the_bag(tmp_path, monkeypatch):
+    """Re-audit #3: a crash between a TP1 event commit and the position-row update must fold
+    forward the WHOLE ladder state — secured (stop REMOVED), n_tp, next rung — not just
+    remaining_frac, else boot resurrects the −30% stop on a secured position and re-fires a
+    duplicate TP1 (the two failure modes that kill the tail the strategy exists for)."""
+    orch = _live_orchestrator(tmp_path, monkeypatch)
+    st = orch.state
+    pid = st.create_position(mint="G", ticker="G", signal_at=T0, signal_price=100.0,
+                             state="ENTERED", t0_epoch=T0.timestamp())
+    st.update_position("G", entry_price=50.0, stake_usd=3.0, tokens_qty=0.06,
+                       remaining_frac=1.0, secured=0, n_tp=0, next_rung_mult=3.0,
+                       stop_price=35.0)
+    # the TP1 leg's event COMMITTED (rem 0.67) but the row update was lost to the crash
+    st.append_event(position_id=pid, mint="G", ts=T0, event_type="TP", price=150.0,
+                    frac=0.33, remaining_frac=0.67, proceeds_usd=2.97)
+    monkeypatch.setattr(orch, "_held_tokens_ex", lambda mint: (0.06 * 0.67, 1))
+    asyncio.run(orch._reconcile_submitted_intents())
+    pos = st.get_position("G")
+    assert pos["remaining_frac"] == pytest.approx(0.67)
+    assert pos["secured"] == 1                        # stake recovered — the stop is GONE
+    assert pos["stop_price"] is None                  # no resurrected −30% stop
+    assert pos["n_tp"] == 1 and pos["next_rung_mult"] == pytest.approx(6.0)
+    orch.state.close()

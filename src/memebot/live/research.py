@@ -9,7 +9,7 @@ stage37 5-param grid with the golden `sim`, split 70/30 chronologically, and gat
     fixed-f log-growth(f=2%) > 0  AND  a $500 single-pass chronological bankroll grows.
 
 Never point EV, never max-over-policies (that printed a false GO — see
-RESEARCH.md). The expected, honest outcome of most runs is "no change":
+docs/STRATEGY_AND_FINDINGS.md). The expected, honest outcome of most runs is "no change":
 config #1 stays a tail bet and nothing clears. A naive re-optimizer chasing recent
 performance would have abandoned #1 during its normal bleed right before the 197x tail.
 
@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import os
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -47,7 +46,7 @@ W48 = 48 * 3600
 GAS = 0.6                  # round-trip fixed solana cost per trade, USD (stage14)
 HOLD_DAYS = 45             # stage14 horizon: min(t0+45d, now)
 MIN_FETCH_H = 12           # minute-resolution window near entry (stage14)
-CHANNEL = os.environ.get("MEMEBOT_CHANNEL", "@your_channel")
+CHANNEL = "@your_channel"
 CORPUS_PULL_LIMIT = 6000
 
 # The FULL stage37 5-param grid: dip x sl x ftp x fsell x reentry (144 configs).
